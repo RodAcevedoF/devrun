@@ -8,7 +8,7 @@ use std::time::Duration;
 use nix::errno::Errno;
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::Pid;
-use portable_pty::{CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
 use tokio::time::{Instant, sleep};
 
 use crate::LaunchSpec;
@@ -53,24 +53,20 @@ impl ManagedProcess {
         let pair = native_pty_system()
             .openpty(size)
             .map_err(|error| error.to_string())?;
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(shell_command(spec, command)?)
             .map_err(|error| error.to_string())?;
         drop(pair.slave);
-        let pid = child
-            .process_id()
-            .ok_or_else(|| "process id is unavailable".to_owned())?;
-        let group = Pid::from_raw(i32::try_from(pid).map_err(|error| error.to_string())?);
+        let attached = attach(child.as_ref(), pair.master.as_ref());
+        let (pid, group, reader, writer) = match attached {
+            Ok(parts) => parts,
+            Err(error) => {
+                let _ = child.kill();
+                return Err(error);
+            }
+        };
         let lifecycle = Arc::new(Lifecycle::default());
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|error| error.to_string())?;
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|error| error.to_string())?;
         forward_output(reader, Arc::clone(&lifecycle), on_output);
         wait_for_leader(child, Arc::clone(&lifecycle), on_exit);
         Ok(Self {
@@ -141,11 +137,34 @@ impl GroupTerminator {
     }
 }
 
+type AttachedPty = (u32, Pid, Box<dyn Read + Send>, Box<dyn Write + Send>);
+
+fn attach(
+    child: &(dyn Child + Send + Sync),
+    master: &dyn MasterPty,
+) -> Result<AttachedPty, String> {
+    let pid = child
+        .process_id()
+        .ok_or_else(|| "process id is unavailable".to_owned())?;
+    let group = Pid::from_raw(i32::try_from(pid).map_err(|error| error.to_string())?);
+    let reader = master
+        .try_clone_reader()
+        .map_err(|error| error.to_string())?;
+    let writer = master.take_writer().map_err(|error| error.to_string())?;
+    Ok((pid, group, reader, writer))
+}
+
 fn group_alive(group: Pid) -> bool {
     killpg(group, None) != Err(Errno::ESRCH)
 }
 
 fn shell_command(spec: &LaunchSpec, command: &str) -> Result<CommandBuilder, String> {
+    if !spec.cwd.is_dir() {
+        return Err(format!(
+            "working directory {} does not exist",
+            spec.cwd.display()
+        ));
+    }
     let mut builder = CommandBuilder::new("/bin/sh");
     builder.arg("-c");
     builder.arg(command);
