@@ -7,6 +7,7 @@ use crate::app::App;
 use crate::ui::{self, Cell};
 
 const INIT_HINT: &str = "run `devrun init` to choose which services to keep";
+const NOTHING: &str = "(none)";
 const DETAIL_INDENT: &str = "    ";
 
 pub fn show(app: &App) -> anyhow::Result<()> {
@@ -154,6 +155,24 @@ fn change_details(change: &Change) -> Vec<String> {
             current.command.to_string(),
             discovered.command.to_string(),
         ),
+        (
+            change.ports_changed(),
+            "ports",
+            listed(&current.ports, " ", |port| format!(":{port}")),
+            listed(&discovered.ports, " ", |port| format!(":{port}")),
+        ),
+        (
+            change.needs_changed(),
+            "needs",
+            listed(&current.needs, ", ", ToString::to_string),
+            listed(&discovered.needs, ", ", ToString::to_string),
+        ),
+        (
+            change.prepare_changed(),
+            "prepare",
+            listed(&current.prepare, "; ", ToString::to_string),
+            listed(&discovered.prepare, "; ", ToString::to_string),
+        ),
     ];
     let mut details: Vec<String> = differences
         .into_iter()
@@ -196,6 +215,14 @@ fn interleave(rows: Vec<String>, details: impl Iterator<Item = Vec<String>>) -> 
         .zip(details)
         .flat_map(|(row, details)| std::iter::once(row).chain(details))
         .collect()
+}
+
+fn listed<T>(values: &[T], separator: &str, show: impl Fn(&T) -> String) -> String {
+    if values.is_empty() {
+        NOTHING.to_owned()
+    } else {
+        values.iter().map(show).collect::<Vec<_>>().join(separator)
+    }
 }
 
 fn joined(names: &[ServiceName]) -> String {

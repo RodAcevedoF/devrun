@@ -62,9 +62,35 @@ impl Change {
         self.current.command != self.candidate.service.command
     }
 
-    fn any_changed(&self) -> bool {
-        self.runtime_changed() || self.path_changed() || self.command_changed()
+    pub fn ports_changed(&self) -> bool {
+        discovered_set_differs(&self.current.ports, &self.candidate.service.ports)
     }
+
+    pub fn needs_changed(&self) -> bool {
+        discovered_set_differs(&self.current.needs, &self.candidate.service.needs)
+    }
+
+    pub fn prepare_changed(&self) -> bool {
+        let discovered = &self.candidate.service.prepare;
+        !discovered.is_empty() && self.current.prepare != *discovered
+    }
+
+    fn any_changed(&self) -> bool {
+        self.runtime_changed()
+            || self.path_changed()
+            || self.command_changed()
+            || self.ports_changed()
+            || self.needs_changed()
+            || self.prepare_changed()
+    }
+}
+
+fn discovered_set_differs<T: Ord>(current: &[T], discovered: &[T]) -> bool {
+    !discovered.is_empty() && as_set(current) != as_set(discovered)
+}
+
+fn as_set<T: Ord>(values: &[T]) -> BTreeSet<&T> {
+    values.iter().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 const MAX_DEPTH: usize = 4;
 const IGNORED_DIRS: [&str; 6] = [
@@ -18,16 +18,9 @@ pub fn directories(root: &Path) -> Vec<PathBuf> {
     found
 }
 
-pub fn is_ignored(name: &OsStr) -> bool {
+fn is_ignored(name: &OsStr) -> bool {
     name.to_str()
         .is_none_or(|name| name.starts_with('.') || IGNORED_DIRS.contains(&name))
-}
-
-pub fn crosses_ignored_dir(relative: &Path) -> bool {
-    relative.components().any(|component| match component {
-        Component::Normal(name) => is_ignored(name),
-        _ => false,
-    })
 }
 
 fn descend(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use devrun_domain::{Candidate, CommandLine, Confidence, Port, RelativePath, Runtime, Service};
+use devrun_domain::{Candidate, Confidence, Port, RelativePath, Runtime, Service};
 use serde_yaml_ng::Value;
 
 use super::ports::parse_port;
@@ -74,8 +74,11 @@ impl ComposeFile<'_> {
         discovery: &mut Discovery,
     ) -> Option<Candidate> {
         let name = discovery.service_name(self.root, &self.location, raw)?;
-        let command =
-            CommandLine::parse(&format!("docker compose -f {} up {raw}", self.file)).ok()?;
+        let command = discovery.command(
+            self.root,
+            &self.location,
+            ["docker", "compose", "-f", self.file, "up", raw],
+        )?;
         let ports: Vec<Port> = definition
             .get("ports")
             .and_then(Value::as_sequence)

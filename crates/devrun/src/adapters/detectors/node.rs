@@ -2,14 +2,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use devrun_domain::{Candidate, CommandLine, Confidence, RelativePath, Runtime, Service};
-use glob::Pattern;
+use glob::{MatchOptions, Pattern};
 use serde::Deserialize;
 
 use super::ports::ports_in;
-use super::walk::crosses_ignored_dir;
+use super::walk::directories;
 use super::{Detector, Discovery};
 
 const MANIFEST: &str = "package.json";
+const WORKSPACE_MATCH: MatchOptions = MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
 const RUN_SCRIPTS: [(&str, Confidence); 3] = [
     ("dev", Confidence::High),
     ("start:dev", Confidence::Medium),
@@ -61,7 +66,17 @@ struct Package {
     manifest: PackageJson,
 }
 
+#[derive(Default)]
+struct WorkspaceGlobs {
+    included: Vec<Pattern>,
+    excluded: Vec<Pattern>,
+}
+
 impl Package {
+    fn manifest_path(&self) -> PathBuf {
+        self.dir.join(MANIFEST)
+    }
+
     fn has_script(&self, script: &str) -> bool {
         self.manifest.scripts.contains_key(script)
     }
@@ -118,10 +133,17 @@ impl Monorepo<'_> {
         let dir_name = package.dir.file_name()?.to_string_lossy();
         let name = discovery.service_name(self.root, &package.dir, &dir_name)?;
         let path = discovery.relative(self.root, &package.dir)?;
-        let command = CommandLine::parse(&format!("{} run {script}", self.manager)).ok()?;
-        let service = Service::new(name, Runtime::Node, path.clone(), command)
+        let manifest_path = package.manifest_path();
+        let command =
+            discovery.command(self.root, &manifest_path, [self.manager, "run", script])?;
+        let prepare = self
+            .prepare_words(package, &path)
+            .into_iter()
+            .map(|words| discovery.command(self.root, &manifest_path, words))
+            .collect::<Option<Vec<CommandLine>>>()?;
+        let service = Service::new(name, Runtime::Node, path, command)
             .with_ports(ports_in(body))
-            .with_prepare(self.prepare(package, &path));
+            .with_prepare(prepare);
         Some(Candidate::new(
             service,
             confidence,
@@ -129,9 +151,9 @@ impl Monorepo<'_> {
         ))
     }
 
-    fn prepare(&self, package: &Package, path: &RelativePath) -> Vec<CommandLine> {
+    fn prepare_words(&self, package: &Package, path: &RelativePath) -> Vec<Vec<String>> {
         let built = self.built_dependencies(package);
-        let commands = if built.is_empty() {
+        if built.is_empty() {
             Vec::new()
         } else if self.uses_turbo {
             let filter = package
@@ -139,17 +161,19 @@ impl Monorepo<'_> {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("./{path}"));
-            vec![format!("npx turbo run build --filter={filter}^...")]
+            vec![owned(&[
+                "npx",
+                "turbo",
+                "run",
+                "build",
+                &format!("--filter={filter}^..."),
+            ])]
         } else {
             built
                 .iter()
-                .map(|dependency| format!("{} run build --workspace {dependency}", self.manager))
+                .map(|dependency| owned(&[self.manager, "run", "build", "--workspace", dependency]))
                 .collect()
-        };
-        commands
-            .iter()
-            .filter_map(|command| CommandLine::parse(command).ok())
-            .collect()
+        }
     }
 
     fn built_dependencies<'p>(&'p self, package: &Package) -> Vec<&'p str> {
@@ -163,6 +187,55 @@ impl Monorepo<'_> {
             .into_iter()
             .collect()
     }
+}
+
+impl WorkspaceGlobs {
+    fn parse(root: &Path, patterns: &[String], discovery: &mut Discovery) -> Self {
+        let mut globs = Self::default();
+        for raw in patterns {
+            let (negated, body) = raw
+                .strip_prefix('!')
+                .map_or((false, raw.as_str()), |body| (true, body));
+            let body = body.trim_start_matches("./").trim_end_matches('/');
+            match Pattern::new(body) {
+                Ok(pattern) => globs.add(negated, pattern, body),
+                Err(error) => discovery.skip(
+                    root,
+                    &root.join(MANIFEST),
+                    format!("workspace pattern `{raw}`: {error}"),
+                ),
+            }
+        }
+        globs
+    }
+
+    fn add(&mut self, negated: bool, pattern: Pattern, body: &str) {
+        let target = if negated {
+            &mut self.excluded
+        } else {
+            &mut self.included
+        };
+        target.push(pattern);
+        if let Some(base) = body
+            .strip_suffix("/**")
+            .and_then(|base| Pattern::new(base).ok())
+        {
+            target.push(base);
+        }
+    }
+
+    fn contains(&self, relative: &Path) -> bool {
+        let matches = |patterns: &[Pattern]| {
+            patterns
+                .iter()
+                .any(|pattern| pattern.matches_path_with(relative, WORKSPACE_MATCH))
+        };
+        matches(&self.included) && !matches(&self.excluded)
+    }
+}
+
+fn owned(words: &[&str]) -> Vec<String> {
+    words.iter().map(|word| (*word).to_owned()).collect()
 }
 
 fn load_package(root: &Path, path: &Path, discovery: &mut Discovery) -> Option<PackageJson> {
@@ -211,37 +284,11 @@ fn package_manager(root: &Path, manifest: &PackageJson) -> &'static str {
 }
 
 fn load_packages(root: &Path, patterns: &[String], discovery: &mut Discovery) -> Vec<Package> {
-    let (excluded, included): (Vec<&String>, Vec<&String>) = patterns
-        .iter()
-        .partition(|pattern| pattern.starts_with('!'));
-    let excluded: Vec<Pattern> = excluded
-        .iter()
-        .filter_map(|pattern| Pattern::new(&pattern[1..]).ok())
-        .collect();
-    let escaped_root = Pattern::escape(&root.to_string_lossy());
-    let mut dirs = BTreeSet::new();
-    for pattern in included {
-        let matches = match glob::glob(&format!("{escaped_root}/{pattern}")) {
-            Ok(matches) => matches,
-            Err(error) => {
-                discovery.skip(
-                    root,
-                    &root.join(MANIFEST),
-                    format!("workspace pattern `{pattern}`: {error}"),
-                );
-                continue;
-            }
-        };
-        dirs.extend(matches.flatten().filter(|dir| {
-            let relative = dir.strip_prefix(root).unwrap_or(dir);
-            dir.join(MANIFEST).is_file()
-                && !crosses_ignored_dir(relative)
-                && !excluded
-                    .iter()
-                    .any(|pattern| pattern.matches_path(relative))
-        }));
-    }
-    dirs.into_iter()
+    let globs = WorkspaceGlobs::parse(root, patterns, discovery);
+    directories(root)
+        .into_iter()
+        .filter(|dir| globs.contains(dir.strip_prefix(root).unwrap_or(dir)))
+        .filter(|dir| dir.join(MANIFEST).is_file())
         .filter_map(|dir| {
             let manifest = load_package(root, &dir.join(MANIFEST), discovery)?;
             Some(Package { dir, manifest })

@@ -3,6 +3,7 @@ mod names;
 mod node;
 mod ports;
 mod python;
+mod shell;
 mod walk;
 
 use std::collections::BTreeMap;
@@ -10,7 +11,7 @@ use std::fmt::Display;
 use std::fs;
 use std::path::Path;
 
-use devrun_domain::{Candidate, RelativePath, Runtime, ServiceName};
+use devrun_domain::{Candidate, CommandLine, RelativePath, Runtime, ServiceName};
 
 use compose::ComposeFiles;
 use node::NodeWorkspaces;
@@ -52,6 +53,17 @@ impl Discovery {
         ServiceName::slug(raw)
             .map_err(|error| self.skip(root, dir, error))
             .ok()
+    }
+
+    fn command<I, S>(&mut self, root: &Path, source: &Path, words: I) -> Option<CommandLine>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let line = shell::join(words)
+            .map_err(|error| self.skip(root, source, error))
+            .ok()?;
+        CommandLine::parse(&line).ok()
     }
 
     fn absorb(&mut self, other: Self) {

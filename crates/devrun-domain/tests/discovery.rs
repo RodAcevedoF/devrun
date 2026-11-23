@@ -66,7 +66,6 @@ fn candidates_differing_in_runtime_path_or_command_are_changed() {
             "web" => candidate.service.command = CommandLine::parse("npm run start").unwrap(),
             "api" => candidate.service.path = RelativePath::parse("apps/backend").unwrap(),
             "mongo" => candidate.service.runtime = Runtime::Compose,
-            "neo4j" => candidate.service.ports = vec![port(7474)],
             _ => {}
         }
     }
@@ -90,6 +89,81 @@ fn candidates_differing_in_runtime_path_or_command_are_changed() {
     assert_eq!(web.candidate.service.command.as_str(), "npm run start");
     assert!(diff.added.is_empty());
     assert!(diff.missing.is_empty());
+}
+
+fn changed_fields(diff: &DiscoveryDiff) -> Vec<(&str, [bool; 6])> {
+    diff.changed
+        .iter()
+        .map(|change| {
+            (
+                change.current.name.as_str(),
+                [
+                    change.runtime_changed(),
+                    change.path_changed(),
+                    change.command_changed(),
+                    change.ports_changed(),
+                    change.needs_changed(),
+                    change.prepare_changed(),
+                ],
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn candidates_differing_in_ports_needs_or_prepare_are_changed() {
+    let mut candidates = unchanged_jaspy_candidates();
+    for candidate in &mut candidates {
+        let service = &mut candidate.service;
+        match service.name.as_str() {
+            "web" => service.ports = vec![port(5174)],
+            "knowledge-graph" => service.needs = vec![name("mongo")],
+            "api" => service.prepare = vec![CommandLine::parse("npm run build").unwrap()],
+            _ => {}
+        }
+    }
+    let diff = DiscoveryDiff::between(&jaspy_like(), &candidates);
+    assert_eq!(
+        changed_fields(&diff),
+        [
+            ("api", [false, false, false, false, false, true]),
+            ("knowledge-graph", [false, false, false, false, true, false]),
+            ("web", [false, false, false, true, false, false]),
+        ]
+    );
+    assert!(diff.added.is_empty());
+    assert!(diff.missing.is_empty());
+}
+
+#[test]
+fn undiscovered_ports_needs_and_prepare_keep_the_configured_values() {
+    let mut candidates = unchanged_jaspy_candidates();
+    for candidate in &mut candidates {
+        candidate.service.ports.clear();
+        candidate.service.needs.clear();
+        candidate.service.prepare.clear();
+    }
+    let diff = DiscoveryDiff::between(&jaspy_like(), &candidates);
+    assert_eq!(diff, DiscoveryDiff::default());
+}
+
+#[test]
+fn ports_and_needs_are_compared_regardless_of_order() {
+    let mut workspace = jaspy_like();
+    workspace
+        .upsert_service(service("web").with_ports([port(5173), port(5174)]))
+        .unwrap();
+    let mut candidates = unchanged_jaspy_candidates();
+    for candidate in &mut candidates {
+        let service = &mut candidate.service;
+        match service.name.as_str() {
+            "web" => service.ports = vec![port(5174), port(5173)],
+            "knowledge-graph" => service.needs = vec![name("neo4j"), name("mongo")],
+            _ => {}
+        }
+    }
+    let diff = DiscoveryDiff::between(&workspace, &candidates);
+    assert_eq!(diff, DiscoveryDiff::default());
 }
 
 #[test]

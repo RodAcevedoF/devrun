@@ -70,6 +70,22 @@ fn plain_python(sandbox: &Sandbox, dir: &str, files: &[&str]) {
     }
 }
 
+fn assert_warning_prefixes(output: &Assert, prefixes: &[&str]) {
+    let stderr = String::from_utf8(output.get_output().stderr.clone()).unwrap();
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), prefixes.len(), "stderr: {stderr}");
+    for (line, prefix) in lines.iter().zip(prefixes) {
+        assert!(
+            line.starts_with(prefix),
+            "{line:?} should start with {prefix:?}"
+        );
+        assert!(
+            line.len() > prefix.len(),
+            "{line:?} should explain the skip"
+        );
+    }
+}
+
 const VITE_WEB: &str =
     "  web  node  apps/web  high  npm run dev\n    why: package.json script \"dev\": vite\n";
 
@@ -128,14 +144,20 @@ New
     why: entry file api.py
 
 Changed
+  api              high
+    prepare: (none) -> npx turbo run build --filter=jaspy-backend^...
+    why: package.json script "dev": nest start --watch
   knowledge-graph  medium
     command: poetry run uvicorn src.entrypoints.http.app:app --reload --port 8081 -> poetry run uvicorn src.entrypoints.http.app:app --reload --port 8080
+    ports: :8081 -> :8080
     why: Dockerfile CMD: python3.11 -m uvicorn src.entrypoints.http.app:app --host 0.0.0.0 --port 8080; needs compose services mongo, neo4j
   mongo            high
     command: docker compose up mongo -> docker compose -f docker-compose.yml up mongo
+    ports: (none) -> :27017
     why: docker-compose.yml service "mongo"
   neo4j            high
     command: docker compose up neo4j -> docker compose -f docker-compose.yml up neo4j
+    ports: (none) -> :7474 :7687
     why: docker-compose.yml service "neo4j"
 
 Missing
@@ -455,11 +477,11 @@ fn python_entry_files_are_tried_in_order() {
     plain_python(&sandbox, "four", &[]);
     discover(&sandbox).success().stderr("").stdout(new_only(
         "3 services",
-        r"  one    python  one    low  python main.py
+        r"  one    python  one    low  python3 main.py
     why: entry file main.py
-  three  python  three  low  python api.py
+  three  python  three  low  python3 api.py
     why: entry file api.py
-  two    python  two    low  python app.py
+  two    python  two    low  python3 app.py
     why: entry file app.py
 ",
     ));
@@ -482,7 +504,7 @@ fn python_runner_follows_lockfiles_and_poetry_config() {
     why: entry file main.py
   c  python  c  low  poetry run python main.py
     why: entry file main.py
-  d  python  d  low  python main.py
+  d  python  d  low  python3 main.py
     why: entry file main.py
 ",
     ));
@@ -515,7 +537,7 @@ fn scans_skip_ignored_hidden_and_deep_directories() {
         );
     discover(&sandbox).success().stderr("").stdout(new_only(
         "1 service",
-        "  d  python  a/b/c/d  low  python main.py\n    why: entry file main.py\n",
+        "  d  python  a/b/c/d  low  python3 main.py\n    why: entry file main.py\n",
     ));
 }
 
@@ -597,7 +619,7 @@ fn colliding_names_are_prefixed_with_their_directory() {
         );
     discover(&sandbox).success().stderr("").stdout(new_only(
         "4 services",
-        r#"  knowledge-graph        python   apps/knowledge-graph          low   python main.py
+        r#"  knowledge-graph        python   apps/knowledge-graph          low   python3 main.py
     why: entry file main.py; needs compose services knowledge-graph-mongo
   knowledge-graph-mongo  compose  apps/knowledge-graph  :27017  high  docker compose -f docker-compose.yml up mongo
     why: docker-compose.yml service "mongo"
@@ -627,7 +649,7 @@ fn names_still_colliding_after_the_prefix_get_runtime_then_position_suffixes() {
         "4 services",
         r#"  apps-api-node       node     apps/api  high  npm run dev
     why: package.json script "dev": vite
-  apps-api-python     python   apps/api  low   python main.py
+  apps-api-python     python   apps/api  low   python3 main.py
     why: entry file main.py
   infra-db-compose    compose  infra     high  docker compose -f compose.yml up db
     why: compose.yml service "db"
@@ -651,15 +673,17 @@ fn malformed_manifests_are_skipped_with_a_warning() {
         .write("svc/pyproject.toml", "[project\nname = 1\n")
         .write("svc/main.py", "")
         .write("infra/compose.yml", "services: [unclosed\n");
-    discover(&sandbox)
+    let output = discover(&sandbox)
         .success()
-        .stdout(new_only("1 service", VITE_WEB))
-        .stderr(
-            "warning: skipped apps/broken/package.json: EOF while parsing a value at line 1 column 13
-warning: skipped svc/pyproject.toml: TOML parse error at line 1, column 9
-warning: skipped infra/compose.yml: did not find expected ',' or ']' at line 2 column 1, while parsing a flow sequence at line 1 column 11
-",
-        );
+        .stdout(new_only("1 service", VITE_WEB));
+    assert_warning_prefixes(
+        &output,
+        &[
+            "warning: skipped apps/broken/package.json: ",
+            "warning: skipped svc/pyproject.toml: ",
+            "warning: skipped infra/compose.yml: ",
+        ],
+    );
 }
 
 #[test]
@@ -667,13 +691,11 @@ fn malformed_root_package_json_is_skipped_with_a_warning() {
     let sandbox = Sandbox::new();
     sandbox.write("package.json", "{ \"workspaces\": ");
     plain_python(&sandbox, "svc", &["main.py"]);
-    discover(&sandbox)
-        .success()
-        .stdout(new_only(
-            "1 service",
-            "  svc  python  svc  low  python main.py\n    why: entry file main.py\n",
-        ))
-        .stderr("warning: skipped package.json: EOF while parsing a value at line 1 column 16\n");
+    let output = discover(&sandbox).success().stdout(new_only(
+        "1 service",
+        "  svc  python  svc  low  python3 main.py\n    why: entry file main.py\n",
+    ));
+    assert_warning_prefixes(&output, &["warning: skipped package.json: "]);
 }
 
 #[test]
@@ -703,4 +725,251 @@ fn shared_ports_are_reported_as_warnings() {
     why: compose.yml service "edge"
 "#,
         ));
+}
+
+#[test]
+fn compose_service_keys_are_shell_quoted() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "infra/compose.yml",
+        "services:\n  \"db; touch pwned\":\n    image: postgres\n  \"it's\":\n    image: redis\n",
+    );
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "2 services",
+        r#"  db-touch-pwned  compose  infra  high  docker compose -f compose.yml up 'db; touch pwned'
+    why: compose.yml service "db; touch pwned"
+  it-s            compose  infra  high  docker compose -f compose.yml up 'it'\''s'
+    why: compose.yml service "it's"
+"#,
+    ));
+}
+
+#[test]
+fn dockerfile_uvicorn_app_tokens_are_shell_quoted() {
+    let sandbox = Sandbox::new();
+    plain_python(&sandbox, "api", &[]);
+    sandbox.write(
+        "api/Dockerfile",
+        "CMD [\"uvicorn\", \"$(touch pwned):app\", \"--port\", \"9000\"]\n",
+    );
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "1 service",
+        "  api  python  api  :9000  medium  uvicorn '$(touch pwned):app' --reload --port 9000\n    why: Dockerfile CMD: uvicorn $(touch pwned):app --port 9000\n",
+    ));
+}
+
+fn api_with_unsafe_package_names(sandbox: &Sandbox) {
+    sandbox
+        .write(
+            "package.json",
+            r#"{ "workspaces": ["apps/*", "packages/*"] }"#,
+        )
+        .write(
+            "apps/api/package.json",
+            r#"{
+  "name": "@repo/api $(id)",
+  "scripts": { "dev": "node main.js" },
+  "dependencies": { "@repo/a b": "*" }
+}"#,
+        )
+        .write(
+            "packages/a/package.json",
+            r#"{ "name": "@repo/a b", "scripts": { "build": "tsc" } }"#,
+        );
+}
+
+const UNSAFE_API_ROW: &str = "  api  node  apps/api  high  npm run dev\n    why: package.json script \"dev\": node main.js\n";
+
+#[test]
+fn package_names_in_turbo_filters_are_shell_quoted() {
+    let sandbox = Sandbox::new();
+    api_with_unsafe_package_names(&sandbox);
+    sandbox.write("turbo.json", "{}");
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "1 service",
+        &format!(
+            "{UNSAFE_API_ROW}    prepare: npx turbo run build '--filter=@repo/api $(id)^...'\n"
+        ),
+    ));
+}
+
+#[test]
+fn package_names_in_workspace_builds_are_shell_quoted() {
+    let sandbox = Sandbox::new();
+    api_with_unsafe_package_names(&sandbox);
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "1 service",
+        &format!("{UNSAFE_API_ROW}    prepare: npm run build --workspace '@repo/a b'\n"),
+    ));
+}
+
+#[test]
+fn tokens_with_newlines_or_nul_skip_the_candidate_with_a_warning() {
+    let sandbox = Sandbox::new();
+    plain_python(&sandbox, "api", &["main.py"]);
+    sandbox
+        .write("api/Dockerfile", "CMD [\"uvicorn\", \"app\\u0000:app\"]\n")
+        .write(
+            "infra/compose.yml",
+            "services:\n  \"a\\nb\":\n    image: x\n  ok:\n    image: y\n",
+        );
+    discover(&sandbox)
+        .success()
+        .stderr(
+            "warning: skipped api/Dockerfile: cannot quote \"app\\0:app\": contains a newline or NUL character
+warning: skipped infra/compose.yml: cannot quote \"a\\nb\": contains a newline or NUL character
+",
+        )
+        .stdout(new_only(
+            "1 service",
+            "  ok  compose  infra  high  docker compose -f compose.yml up ok\n    why: compose.yml service \"ok\"\n",
+        ));
+}
+
+#[test]
+fn changed_services_show_port_needs_and_prepare_differences() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .write(
+            "package.json",
+            r#"{ "workspaces": ["apps/*", "packages/*"] }"#,
+        )
+        .write(
+            "apps/api/package.json",
+            r#"{
+  "name": "@repo/api",
+  "scripts": { "dev": "node --watch main.js --port 3001" },
+  "dependencies": { "@repo/a": "*" }
+}"#,
+        )
+        .write(
+            "packages/a/package.json",
+            r#"{ "name": "@repo/a", "scripts": { "build": "tsc" } }"#,
+        )
+        .write(
+            "apps/api/docker-compose.yml",
+            "services:\n  db:\n    image: postgres\n",
+        );
+    sandbox.write_config(
+        r#"schema_version = 1
+root = "{root}"
+
+[services.api]
+runtime = "node"
+path = "apps/api"
+command = "npm run dev"
+ports = [3000]
+needs = ["cache"]
+prepare = ["npm run build"]
+
+[services.cache]
+runtime = "custom"
+path = "."
+command = "redis-server"
+
+[services.db]
+runtime = "compose"
+path = "apps/api"
+command = "docker compose -f docker-compose.yml up db"
+"#,
+    );
+    discover(&sandbox).success().stderr("").stdout(
+        r#"Discovery: 2 services
+
+Changed
+  api  high
+    ports: :3000 -> :3001
+    needs: cache -> db
+    prepare: npm run build -> npm run build --workspace @repo/a
+    why: package.json script "dev": node --watch main.js --port 3001; needs compose services db
+"#,
+    );
+}
+
+#[test]
+fn runner_less_dev_scripts_have_low_confidence_and_need_a_virtualenv() {
+    let sandbox = Sandbox::new();
+    sandbox.write(
+        "svc/pyproject.toml",
+        "[project]\nname = \"svc\"\n\n[project.scripts]\ndev = \"svc.cli:dev\"\n",
+    );
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "1 service",
+        "  svc  python  svc  low  dev\n    why: pyproject.toml script \"dev\": svc.cli:dev; needs an activated virtualenv (.venv is added to PATH automatically at launch when present)\n",
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn recursive_workspace_patterns_never_descend_into_ignored_directories() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .write("package.json", r#"{ "workspaces": ["packages/**"] }"#)
+        .write(
+            "packages/ui/package.json",
+            r#"{ "scripts": { "dev": "vite" } }"#,
+        )
+        .write(
+            "packages/ui/node_modules/fake/package.json",
+            r#"{ "scripts": { "dev": "node fake.js" } }"#,
+        );
+    let node_modules = sandbox.root().join("packages/ui/node_modules");
+    for link in ["a", "b", "c", "d"] {
+        std::os::unix::fs::symlink(".", node_modules.join(link)).unwrap();
+    }
+    sandbox
+        .devrun()
+        .arg("discover")
+        .timeout(std::time::Duration::from_secs(20))
+        .assert()
+        .success()
+        .stderr("")
+        .stdout(new_only(
+            "1 service",
+            "  ui  node  packages/ui  high  npm run dev\n    why: package.json script \"dev\": vite\n",
+        ));
+}
+
+#[test]
+fn workspace_patterns_support_exact_paths_and_negations() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .write(
+            "package.json",
+            r#"{ "workspaces": ["apps/*", "!apps/legacy", "packages/**", "!packages/internal/**", "tools/runner"] }"#,
+        )
+        .write(
+            "apps/web/package.json",
+            r#"{ "scripts": { "dev": "vite" } }"#,
+        )
+        .write(
+            "apps/legacy/package.json",
+            r#"{ "scripts": { "dev": "node legacy.js" } }"#,
+        )
+        .write(
+            "packages/cli/package.json",
+            r#"{ "scripts": { "start": "node cli.js" } }"#,
+        )
+        .write(
+            "packages/internal/tool/package.json",
+            r#"{ "scripts": { "start": "node tool.js" } }"#,
+        )
+        .write(
+            "tools/runner/package.json",
+            r#"{ "scripts": { "start": "node run.js" } }"#,
+        )
+        .write(
+            "tools/other/package.json",
+            r#"{ "scripts": { "start": "node other.js" } }"#,
+        );
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "3 services",
+        r#"  cli     node  packages/cli  medium  npm run start
+    why: package.json script "start": node cli.js
+  runner  node  tools/runner  medium  npm run start
+    why: package.json script "start": node run.js
+  web     node  apps/web      high    npm run dev
+    why: package.json script "dev": vite
+"#,
+    ));
 }

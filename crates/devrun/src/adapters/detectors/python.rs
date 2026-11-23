@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use devrun_domain::{Candidate, CommandLine, Confidence, Port, Runtime, Service};
+use devrun_domain::{Candidate, Confidence, Port, Runtime, Service};
 
 use super::ports::ports_in;
 use super::walk::directories;
@@ -10,11 +10,43 @@ const MANIFEST: &str = "pyproject.toml";
 const DOCKERFILE: &str = "Dockerfile";
 const ENTRY_FILES: [&str; 3] = ["api.py", "main.py", "app.py"];
 const LAUNCH_INSTRUCTIONS: [&str; 2] = ["CMD", "ENTRYPOINT"];
+const VIRTUALENV_NOTE: &str =
+    "needs an activated virtualenv (.venv is added to PATH automatically at launch when present)";
 
 pub struct PythonProjects;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Runner {
+    Uv,
+    Poetry,
+    Bare,
+}
+
+impl Runner {
+    fn detect(dir: &Path, manifest: &toml::Table) -> Self {
+        if dir.join("uv.lock").is_file() {
+            Self::Uv
+        } else if dir.join("poetry.lock").is_file()
+            || table_at(manifest, &["tool", "poetry"]).is_some()
+        {
+            Self::Poetry
+        } else {
+            Self::Bare
+        }
+    }
+
+    fn words(self) -> &'static [&'static str] {
+        match self {
+            Self::Uv => &["uv", "run"],
+            Self::Poetry => &["poetry", "run"],
+            Self::Bare => &[],
+        }
+    }
+}
+
 struct Launch {
-    command: String,
+    words: Vec<String>,
+    source: &'static str,
     ports: Vec<Port>,
     confidence: Confidence,
     evidence: String,
@@ -40,34 +72,21 @@ fn candidate(root: &Path, dir: &Path, discovery: &mut Discovery) -> Option<Candi
     let manifest: toml::Table = toml::from_str(&text)
         .map_err(|error| discovery.skip(root, &manifest_path, error))
         .ok()?;
-    let launch = dev_script(&manifest)
+    let runner = Runner::detect(dir, &manifest);
+    let launch = dev_script(&manifest, runner)
         .or_else(|| uvicorn_image(root, dir, discovery))
-        .or_else(|| entry_file(dir))?;
+        .or_else(|| entry_file(dir, runner))?;
     let dir_name = dir.file_name()?.to_string_lossy();
     let name = discovery.service_name(root, dir, &dir_name)?;
     let path = discovery.relative(root, dir)?;
-    let command = CommandLine::parse(&with_runner(runner(dir, &manifest), &launch.command)).ok()?;
+    let words = runner
+        .words()
+        .iter()
+        .map(|word| (*word).to_owned())
+        .chain(launch.words);
+    let command = discovery.command(root, &dir.join(launch.source), words)?;
     let service = Service::new(name, Runtime::Python, path, command).with_ports(launch.ports);
     Some(Candidate::new(service, launch.confidence, launch.evidence))
-}
-
-fn runner(dir: &Path, manifest: &toml::Table) -> &'static str {
-    if dir.join("uv.lock").is_file() {
-        "uv run"
-    } else if dir.join("poetry.lock").is_file() || table_at(manifest, &["tool", "poetry"]).is_some()
-    {
-        "poetry run"
-    } else {
-        ""
-    }
-}
-
-fn with_runner(runner: &str, command: &str) -> String {
-    if runner.is_empty() {
-        command.to_owned()
-    } else {
-        format!("{runner} {command}")
-    }
 }
 
 fn table_at<'a>(manifest: &'a toml::Table, keys: &[&str]) -> Option<&'a toml::Table> {
@@ -75,7 +94,7 @@ fn table_at<'a>(manifest: &'a toml::Table, keys: &[&str]) -> Option<&'a toml::Ta
         .try_fold(manifest, |table, key| table.get(*key)?.as_table())
 }
 
-fn dev_script(manifest: &toml::Table) -> Option<Launch> {
+fn dev_script(manifest: &toml::Table, runner: Runner) -> Option<Launch> {
     let script = [
         &["tool", "poetry", "scripts"][..],
         &["project", "scripts"][..],
@@ -85,11 +104,17 @@ fn dev_script(manifest: &toml::Table) -> Option<Launch> {
     let body = script
         .as_str()
         .map_or_else(|| script.to_string(), ToOwned::to_owned);
+    let evidence = format!("{MANIFEST} script \"dev\": {body}");
+    let (confidence, evidence) = match runner {
+        Runner::Bare => (Confidence::Low, format!("{evidence}; {VIRTUALENV_NOTE}")),
+        Runner::Uv | Runner::Poetry => (Confidence::High, evidence),
+    };
     Some(Launch {
-        command: "dev".to_owned(),
+        words: vec!["dev".to_owned()],
+        source: MANIFEST,
         ports: ports_in(&body),
-        confidence: Confidence::High,
-        evidence: format!("{MANIFEST} script \"dev\": {body}"),
+        confidence,
+        evidence,
     })
 }
 
@@ -116,12 +141,13 @@ fn uvicorn_launch(line: &str) -> Option<Launch> {
         .filter(|token| !token.starts_with('-'))?;
     let shown = tokens.join(" ");
     let ports = ports_in(&shown);
-    let command = match ports.first() {
-        Some(port) => format!("uvicorn {app} --reload --port {port}"),
-        None => format!("uvicorn {app} --reload"),
-    };
+    let mut words = vec!["uvicorn".to_owned(), app.clone(), "--reload".to_owned()];
+    if let Some(port) = ports.first() {
+        words.extend(["--port".to_owned(), port.to_string()]);
+    }
     Some(Launch {
-        command,
+        words,
+        source: DOCKERFILE,
         ports,
         confidence: Confidence::Medium,
         evidence: format!("{DOCKERFILE} {instruction}: {shown}"),
@@ -137,12 +163,18 @@ fn instruction_tokens(arguments: &str) -> Vec<String> {
     })
 }
 
-fn entry_file(dir: &Path) -> Option<Launch> {
+fn entry_file(dir: &Path, runner: Runner) -> Option<Launch> {
     let file = ENTRY_FILES
         .into_iter()
         .find(|file| dir.join(file).is_file())?;
+    let interpreter = if runner == Runner::Bare {
+        "python3"
+    } else {
+        "python"
+    };
     Some(Launch {
-        command: format!("python {file}"),
+        words: vec![interpreter.to_owned(), file.to_owned()],
+        source: file,
         ports: Vec::new(),
         confidence: Confidence::Low,
         evidence: format!("entry file {file}"),
