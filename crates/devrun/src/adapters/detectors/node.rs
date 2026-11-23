@@ -171,7 +171,14 @@ impl Monorepo<'_> {
         } else {
             built
                 .iter()
-                .map(|dependency| owned(&[self.manager, "run", "build", "--workspace", dependency]))
+                .map(|dependency| {
+                    owned(&[
+                        self.manager,
+                        "run",
+                        "build",
+                        &format!("--workspace={dependency}"),
+                    ])
+                })
                 .collect()
         }
     }

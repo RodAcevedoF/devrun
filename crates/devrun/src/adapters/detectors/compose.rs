@@ -74,10 +74,17 @@ impl ComposeFile<'_> {
         discovery: &mut Discovery,
     ) -> Option<Candidate> {
         let name = discovery.service_name(self.root, &self.location, raw)?;
+        let operands: &[&str] = if raw.starts_with('-') {
+            &["--", raw]
+        } else {
+            &[raw]
+        };
         let command = discovery.command(
             self.root,
             &self.location,
-            ["docker", "compose", "-f", self.file, "up", raw],
+            ["docker", "compose", "-f", self.file, "up"]
+                .iter()
+                .chain(operands),
         )?;
         let ports: Vec<Port> = definition
             .get("ports")

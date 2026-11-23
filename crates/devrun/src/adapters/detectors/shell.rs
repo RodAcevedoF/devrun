@@ -42,3 +42,6 @@ pub fn quote(word: &str) -> Result<Cow<'_, str>, UnquotableToken> {
 fn is_safe(c: char) -> bool {
     c.is_ascii_alphanumeric() || SAFE_PUNCTUATION.contains(c)
 }
+
+#[cfg(test)]
+mod tests;

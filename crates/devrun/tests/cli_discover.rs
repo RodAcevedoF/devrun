@@ -380,9 +380,44 @@ fn prepare_builds_each_workspace_dependency_without_turbo() {
         "1 service",
         r#"  api  node  apps/api  high  npm run dev
     why: package.json script "dev": node --watch src/main.js
-    prepare: npm run build --workspace @repo/a
-    prepare: npm run build --workspace @repo/b
+    prepare: npm run build --workspace=@repo/a
+    prepare: npm run build --workspace=@repo/b
 "#,
+    ));
+}
+
+#[test]
+fn dash_leading_workspace_names_stay_option_values() {
+    let sandbox = Sandbox::new();
+    sandbox
+        .write(
+            "package.json",
+            r#"{ "workspaces": ["apps/*", "packages/*"] }"#,
+        )
+        .write(
+            "apps/api/package.json",
+            r#"{ "name": "api", "scripts": { "dev": "node main.js" }, "dependencies": { "-leading": "*" } }"#,
+        )
+        .write(
+            "packages/lead/package.json",
+            r#"{ "name": "-leading", "scripts": { "build": "tsc" } }"#,
+        );
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "1 service",
+        r#"  api  node  apps/api  high  npm run dev
+    why: package.json script "dev": node main.js
+    prepare: npm run build --workspace=-leading
+"#,
+    ));
+}
+
+#[test]
+fn dash_leading_compose_services_are_passed_after_the_options() {
+    let sandbox = Sandbox::new();
+    sandbox.write("infra/compose.yml", "services:\n  \"-d\":\n    image: x\n");
+    discover(&sandbox).success().stderr("").stdout(new_only(
+        "1 service",
+        "  d  compose  infra  high  docker compose -f compose.yml up -- -d\n    why: compose.yml service \"-d\"\n",
     ));
 }
 
@@ -799,7 +834,7 @@ fn package_names_in_workspace_builds_are_shell_quoted() {
     api_with_unsafe_package_names(&sandbox);
     discover(&sandbox).success().stderr("").stdout(new_only(
         "1 service",
-        &format!("{UNSAFE_API_ROW}    prepare: npm run build --workspace '@repo/a b'\n"),
+        &format!("{UNSAFE_API_ROW}    prepare: npm run build '--workspace=@repo/a b'\n"),
     ));
 }
 
@@ -880,7 +915,7 @@ Changed
   api  high
     ports: :3000 -> :3001
     needs: cache -> db
-    prepare: npm run build -> npm run build --workspace @repo/a
+    prepare: npm run build -> npm run build --workspace=@repo/a
     why: package.json script "dev": node --watch main.js --port 3001; needs compose services db
 "#,
     );
