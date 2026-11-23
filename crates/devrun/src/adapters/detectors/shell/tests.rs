@@ -4,7 +4,20 @@ use std::process::Command;
 
 use super::{join, quote};
 
-const HOSTILE: [&str; 14] = [
+const HOSTILE: [&str; 27] = [
+    "$0",
+    "a;b",
+    "a&b",
+    "a|b",
+    "a>b",
+    "a<b",
+    "(x)",
+    "a`b",
+    "a\\b",
+    "{a,b}",
+    "#x",
+    "?",
+    "[ab]",
     "$(touch pwned)",
     "`touch pwned`",
     "a;touch pwned",
@@ -24,6 +37,7 @@ const HOSTILE: [&str; 14] = [
 #[test]
 fn hostile_words_reach_the_program_verbatim_through_sh() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("b"), "").unwrap();
     let line = join(["printf", "%s\\n"].into_iter().chain(HOSTILE)).unwrap();
     let output = Command::new("/bin/sh")
         .arg("-c")
