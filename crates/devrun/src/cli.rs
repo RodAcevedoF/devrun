@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use crate::app::App;
-use crate::slices::{catalog, config, discover, plan};
+use crate::slices::{alias, catalog, config, discover, init, plan, profile, up};
 use crate::ui;
 
 #[derive(Parser)]
@@ -33,6 +33,18 @@ enum Command {
     Plan(TargetArgs),
     #[command(about = "Scan the repository for services and compare them with the config")]
     Discover,
+    #[command(
+        about = "Discover the repository and choose services, aliases and profiles interactively"
+    )]
+    Init(init::InitArgs),
+    #[command(
+        about = "Start services, aliases or @profiles in the dashboard (interactive picker without targets)"
+    )]
+    Up(up::UpArgs),
+    #[command(subcommand, about = "Manage short names for services")]
+    Alias(alias::AliasCommand),
+    #[command(subcommand, about = "Manage named combinations of services")]
+    Profile(profile::ProfileCommand),
     #[command(subcommand, about = "Inspect devrun's own configuration")]
     Config(ConfigCommand),
 }
@@ -72,6 +84,10 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Ls => catalog::list(&app),
         Command::Plan(args) => plan::show(&app, &args.targets),
         Command::Discover => discover::show(&app),
+        Command::Init(args) => init::run(&app, &args),
+        Command::Up(args) => up::run(&app, &args),
+        Command::Alias(command) => alias::run(&app, &command),
+        Command::Profile(command) => profile::run(&app, &command),
         Command::Config(ConfigCommand::Path) => {
             config::path(&app);
             Ok(())
