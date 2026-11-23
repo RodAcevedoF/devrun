@@ -49,6 +49,10 @@ pub enum Event {
         source: OutputSource,
         bytes: Vec<u8>,
     },
+    OutputDropped {
+        service: ServiceId,
+        bytes: u64,
+    },
     Rejected {
         reason: String,
     },

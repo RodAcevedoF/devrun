@@ -14,6 +14,8 @@ pub enum SupervisorError {
     NoRuntime,
     #[error("supervisor is no longer running")]
     Closed,
+    #[error("cannot listen for termination signals: {0}")]
+    Signals(String),
 }
 
 fn join(ids: &[ServiceId]) -> String {

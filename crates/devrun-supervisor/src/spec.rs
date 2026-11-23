@@ -37,6 +37,7 @@ pub struct SupervisorOptions {
     pub health_interval: Duration,
     pub rows: u16,
     pub cols: u16,
+    pub output_buffer_bytes: usize,
 }
 
 impl Default for SupervisorOptions {
@@ -46,6 +47,7 @@ impl Default for SupervisorOptions {
             health_interval: Duration::from_millis(500),
             rows: 24,
             cols: 80,
+            output_buffer_bytes: 1024 * 1024,
         }
     }
 }

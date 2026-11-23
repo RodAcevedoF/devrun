@@ -3,18 +3,15 @@ use tokio::sync::{mpsc, watch};
 
 use crate::health::HealthProbe;
 use crate::process::{ExitCode, ManagedProcess};
+use crate::queue::Publisher;
 use crate::spec::LaunchPlan;
 use crate::{
     Command, Event, LaunchSpec, OutputSource, ServiceId, ServiceState, ServiceStatus,
     SupervisorOptions,
 };
 
+#[derive(Clone, Copy)]
 enum Internal {
-    Output {
-        service: usize,
-        source: OutputSource,
-        bytes: Vec<u8>,
-    },
     LeaderExited {
         service: usize,
         generation: u64,
@@ -78,7 +75,7 @@ pub(crate) struct Coordinator {
     start_order: Vec<usize>,
     options: SupervisorOptions,
     size: PtySize,
-    events: mpsc::UnboundedSender<Event>,
+    events: Publisher,
     snapshot: watch::Sender<Vec<ServiceStatus>>,
     internal_sender: mpsc::UnboundedSender<Internal>,
     internal: mpsc::UnboundedReceiver<Internal>,
@@ -87,11 +84,7 @@ pub(crate) struct Coordinator {
 }
 
 impl Coordinator {
-    pub fn new(
-        plan: LaunchPlan,
-        options: SupervisorOptions,
-        events: mpsc::UnboundedSender<Event>,
-    ) -> Self {
+    pub fn new(plan: LaunchPlan, options: SupervisorOptions, events: Publisher) -> Self {
         let slots: Vec<Slot> = plan
             .specs
             .into_iter()
@@ -177,15 +170,6 @@ impl Coordinator {
 
     fn handle_internal(&mut self, message: Internal) {
         match message {
-            Internal::Output {
-                service,
-                source,
-                bytes,
-            } => self.emit(Event::Output {
-                service: self.slots[service].spec.id.clone(),
-                source,
-                bytes,
-            }),
             Internal::LeaderExited {
                 service,
                 generation,
@@ -355,20 +339,15 @@ impl Coordinator {
         phase: Phase,
         command: &str,
     ) -> Result<ManagedProcess, String> {
-        let output = self.internal_sender.clone();
+        let output = self
+            .events
+            .output_sink(self.slots[service].spec.id.clone(), phase.source());
         let exit = self.internal_sender.clone();
-        let source = phase.source();
         ManagedProcess::spawn(
             &self.slots[service].spec,
             command,
             self.size,
-            move |bytes| {
-                let _ = output.send(Internal::Output {
-                    service,
-                    source,
-                    bytes,
-                });
-            },
+            move |bytes| output.send(bytes),
             move || {
                 let _ = exit.send(Internal::LeaderExited {
                     service,
@@ -522,7 +501,7 @@ impl Coordinator {
     }
 
     fn emit(&self, event: Event) {
-        let _ = self.events.send(event);
+        self.events.publish(event);
     }
 }
 

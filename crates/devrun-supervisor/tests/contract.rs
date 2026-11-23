@@ -126,6 +126,10 @@ fn events_round_trip_through_json() {
             source: OutputSource::Service,
             bytes: vec![0, 255, 13, 10],
         },
+        Event::OutputDropped {
+            service: id("api"),
+            bytes: 65_536,
+        },
         Event::Rejected {
             reason: "unknown service `ghost`".to_owned(),
         },

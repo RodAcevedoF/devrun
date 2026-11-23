@@ -1,6 +1,7 @@
 use tokio::sync::{mpsc, watch};
 
 use crate::coordinator::Coordinator;
+use crate::queue::{EventQueue, event_queue};
 use crate::spec::LaunchPlan;
 use crate::{Command, Event, LaunchSpec, ServiceStatus, SupervisorError, SupervisorOptions};
 
@@ -15,8 +16,8 @@ impl Supervisor {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| SupervisorError::NoRuntime)?;
         let (command_sender, commands) = mpsc::unbounded_channel();
-        let (event_sender, events) = mpsc::unbounded_channel();
-        let coordinator = Coordinator::new(plan, options, event_sender);
+        let (publisher, events) = event_queue(options.output_buffer_bytes);
+        let coordinator = Coordinator::new(plan, options, publisher);
         let snapshot = coordinator.subscribe();
         runtime.spawn(coordinator.run(commands));
         Ok(SupervisorHandle {
@@ -29,7 +30,7 @@ impl Supervisor {
 
 pub struct SupervisorHandle {
     commands: mpsc::UnboundedSender<Command>,
-    events: mpsc::UnboundedReceiver<Event>,
+    events: EventQueue,
     snapshot: watch::Receiver<Vec<ServiceStatus>>,
 }
 
@@ -42,6 +43,10 @@ impl SupervisorHandle {
 
     pub async fn recv(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Option<Event> {
+        self.events.try_recv()
     }
 
     pub fn snapshot(&self) -> Vec<ServiceStatus> {
