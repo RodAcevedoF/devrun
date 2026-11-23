@@ -118,6 +118,12 @@ fn candidate_details(candidate: &Candidate) -> Vec<String> {
             .iter()
             .map(|command| detail(&format!("prepare: {command}"))),
     );
+    if !candidate.service.watch.is_empty() {
+        details.push(detail(&format!(
+            "watch: {}",
+            listed(&candidate.service.watch, " ", ToString::to_string)
+        )));
+    }
     details
 }
 
@@ -172,6 +178,12 @@ fn change_details(change: &Change) -> Vec<String> {
             "prepare",
             listed(&current.prepare, "; ", ToString::to_string),
             listed(&discovered.prepare, "; ", ToString::to_string),
+        ),
+        (
+            change.watch_changed(),
+            "watch",
+            listed(&current.watch, " ", ToString::to_string),
+            listed(&discovered.watch, " ", ToString::to_string),
         ),
     ];
     let mut details: Vec<String> = differences

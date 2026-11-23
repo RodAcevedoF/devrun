@@ -34,6 +34,8 @@ pub struct ServiceEntry {
     pub needs: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prepare: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
@@ -94,6 +96,7 @@ impl ServiceEntry {
             ports: service.ports.iter().map(|port| port.get()).collect(),
             needs: strings(&service.needs),
             prepare: strings(&service.prepare),
+            watch: strings(&service.watch),
             env: service
                 .env
                 .iter()
@@ -122,6 +125,7 @@ impl ServiceEntry {
         .with_ports(ports)
         .with_needs(parse_all(&self.needs, ServiceName::parse)?)
         .with_prepare(parse_all(&self.prepare, CommandLine::parse)?)
+        .with_watch(parse_all(&self.watch, RelativePath::parse)?)
         .with_env(env))
     }
 }

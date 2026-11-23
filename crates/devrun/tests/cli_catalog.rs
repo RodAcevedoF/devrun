@@ -178,3 +178,59 @@ fn config_for_another_repository_is_rejected() {
         sandbox.root().display()
     ));
 }
+
+const API_CONFIG: &str = "schema_version = 1\nroot = \"{root}\"\n\n[services.api]\nruntime = \"node\"\npath = \"apps/api\"\ncommand = \"npm run dev\"\n";
+
+const WATCH_DIRS: &str = "watch = [\n    \"packages/a\",\n    \"packages/b\",\n]\n";
+
+fn resaved(sandbox: &Sandbox) -> String {
+    for args in [&["alias", "set", "be", "api"][..], &["alias", "rm", "be"]] {
+        sandbox.devrun().args(args).assert().success().stderr("");
+    }
+    fs::read_to_string(sandbox.config_path()).unwrap()
+}
+
+#[test]
+fn configs_without_watch_dirs_resave_byte_identical() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write_config(API_CONFIG);
+    let before = fs::read_to_string(&path).unwrap();
+    assert_eq!(resaved(&sandbox), before);
+}
+
+#[test]
+fn watch_dirs_round_trip_through_the_config() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write_config(&format!("{API_CONFIG}{WATCH_DIRS}"));
+    let before = fs::read_to_string(&path).unwrap();
+    assert_eq!(resaved(&sandbox), before);
+}
+
+#[test]
+fn watch_dirs_are_saved_sorted_without_duplicates() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write_config(&format!(
+        "{API_CONFIG}watch = [\"packages/b\", \"./packages/a\", \"packages/b\"]\n"
+    ));
+    let expected = fs::read_to_string(&path).unwrap().replace(
+        "watch = [\"packages/b\", \"./packages/a\", \"packages/b\"]\n",
+        WATCH_DIRS,
+    );
+    assert_eq!(resaved(&sandbox), expected);
+}
+
+#[test]
+fn watch_dirs_outside_the_repository_are_rejected() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.write_config(&format!("{API_CONFIG}watch = [\"../outside\"]\n"));
+    sandbox
+        .devrun()
+        .arg("ls")
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(format!(
+            "error: invalid config {}: invalid path `../outside`: must not leave the repository\n",
+            path.display()
+        ));
+}

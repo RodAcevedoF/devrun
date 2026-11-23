@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
@@ -174,6 +174,7 @@ pub struct Service {
     pub ports: Vec<Port>,
     pub needs: Vec<ServiceName>,
     pub prepare: Vec<CommandLine>,
+    pub watch: Vec<RelativePath>,
 }
 
 impl Service {
@@ -192,6 +193,7 @@ impl Service {
             ports: Vec::new(),
             needs: Vec::new(),
             prepare: Vec::new(),
+            watch: Vec::new(),
         }
     }
 
@@ -210,6 +212,16 @@ impl Service {
     #[must_use]
     pub fn with_prepare(mut self, prepare: impl IntoIterator<Item = CommandLine>) -> Self {
         self.prepare = prepare.into_iter().collect();
+        self
+    }
+
+    #[must_use]
+    pub fn with_watch(mut self, dirs: impl IntoIterator<Item = RelativePath>) -> Self {
+        self.watch = dirs
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         self
     }
 

@@ -136,14 +136,20 @@ impl Monorepo<'_> {
         let manifest_path = package.manifest_path();
         let command =
             discovery.command(self.root, &manifest_path, [self.manager, "run", script])?;
+        let built = self.built_dependencies(package);
         let prepare = self
-            .prepare_words(package, &path)
+            .prepare_words(package, &path, &built)
             .into_iter()
             .map(|words| discovery.command(self.root, &manifest_path, words))
             .collect::<Option<Vec<CommandLine>>>()?;
+        let watch = built
+            .iter()
+            .map(|dependency| discovery.relative(self.root, &dependency.dir))
+            .collect::<Option<Vec<RelativePath>>>()?;
         let service = Service::new(name, Runtime::Node, path, command)
             .with_ports(ports_in(body))
-            .with_prepare(prepare);
+            .with_prepare(prepare)
+            .with_watch(watch);
         Some(Candidate::new(
             service,
             confidence,
@@ -151,8 +157,12 @@ impl Monorepo<'_> {
         ))
     }
 
-    fn prepare_words(&self, package: &Package, path: &RelativePath) -> Vec<Vec<String>> {
-        let built = self.built_dependencies(package);
+    fn prepare_words(
+        &self,
+        package: &Package,
+        path: &RelativePath,
+        built: &[&Package],
+    ) -> Vec<Vec<String>> {
         if built.is_empty() {
             Vec::new()
         } else if self.uses_turbo {
@@ -171,6 +181,9 @@ impl Monorepo<'_> {
         } else {
             built
                 .iter()
+                .filter_map(|dependency| dependency.manifest.name.as_deref())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .map(|dependency| {
                     owned(&[
                         self.manager,
@@ -183,15 +196,19 @@ impl Monorepo<'_> {
         }
     }
 
-    fn built_dependencies<'p>(&'p self, package: &Package) -> Vec<&'p str> {
+    fn built_dependencies(&self, package: &Package) -> Vec<&Package> {
         let wanted = package.dependency_names();
+        let own_name = package.manifest.name.as_deref();
         self.packages
             .iter()
             .filter(|other| other.has_script("build"))
-            .filter_map(|other| other.manifest.name.as_deref())
-            .filter(|name| wanted.contains(name) && package.manifest.name.as_deref() != Some(name))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .filter(|other| {
+                other
+                    .manifest
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| wanted.contains(name) && own_name != Some(name))
+            })
             .collect()
     }
 }

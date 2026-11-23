@@ -75,6 +75,10 @@ impl Change {
         !discovered.is_empty() && self.current.prepare != *discovered
     }
 
+    pub fn watch_changed(&self) -> bool {
+        discovered_set_differs(&self.current.watch, &self.candidate.service.watch)
+    }
+
     fn any_changed(&self) -> bool {
         self.runtime_changed()
             || self.path_changed()
@@ -82,6 +86,7 @@ impl Change {
             || self.ports_changed()
             || self.needs_changed()
             || self.prepare_changed()
+            || self.watch_changed()
     }
 }
 

@@ -11,6 +11,7 @@ const INIT_HINT: &str = "run `devrun init` to choose which services to keep";
 const JASPY_ROWS: &str = r#"  api                      node     apps/api                                   high    npm run dev
     why: package.json script "dev": nest start --watch
     prepare: npx turbo run build --filter=jaspy-backend^...
+    watch: packages/company-enrichment-core packages/plaid-sync-core
   chatbot-api              node     apps/chatbot-api                           high    npm run dev
     why: package.json script "dev": tsc --watch & node --watch dist/index.js
   data-feeder              python   apps/data-feeder                           low     poetry run python main.py
@@ -146,6 +147,7 @@ New
 Changed
   api              high
     prepare: (none) -> npx turbo run build --filter=jaspy-backend^...
+    watch: (none) -> packages/company-enrichment-core packages/plaid-sync-core
     why: package.json script "dev": nest start --watch
   knowledge-graph  medium
     command: poetry run uvicorn src.entrypoints.http.app:app --reload --port 8081 -> poetry run uvicorn src.entrypoints.http.app:app --reload --port 8080
@@ -382,6 +384,7 @@ fn prepare_builds_each_workspace_dependency_without_turbo() {
     why: package.json script "dev": node --watch src/main.js
     prepare: npm run build --workspace=@repo/a
     prepare: npm run build --workspace=@repo/b
+    watch: packages/a packages/b
 "#,
     ));
 }
@@ -407,6 +410,7 @@ fn dash_leading_workspace_names_stay_option_values() {
         r#"  api  node  apps/api  high  npm run dev
     why: package.json script "dev": node main.js
     prepare: npm run build --workspace=-leading
+    watch: packages/lead
 "#,
     ));
 }
@@ -431,6 +435,7 @@ fn prepare_uses_one_turbo_filter_when_turbo_json_exists() {
         r#"  api  node  apps/api  high  npm run dev
     why: package.json script "dev": node --watch src/main.js
     prepare: npx turbo run build --filter=@repo/api^...
+    watch: packages/a packages/b
 "#,
     ));
 }
@@ -823,7 +828,7 @@ fn package_names_in_turbo_filters_are_shell_quoted() {
     discover(&sandbox).success().stderr("").stdout(new_only(
         "1 service",
         &format!(
-            "{UNSAFE_API_ROW}    prepare: npx turbo run build '--filter=@repo/api $(id)^...'\n"
+            "{UNSAFE_API_ROW}    prepare: npx turbo run build '--filter=@repo/api $(id)^...'\n    watch: packages/a\n"
         ),
     ));
 }
@@ -834,7 +839,9 @@ fn package_names_in_workspace_builds_are_shell_quoted() {
     api_with_unsafe_package_names(&sandbox);
     discover(&sandbox).success().stderr("").stdout(new_only(
         "1 service",
-        &format!("{UNSAFE_API_ROW}    prepare: npm run build '--workspace=@repo/a b'\n"),
+        &format!(
+            "{UNSAFE_API_ROW}    prepare: npm run build '--workspace=@repo/a b'\n    watch: packages/a\n"
+        ),
     ));
 }
 
@@ -916,6 +923,7 @@ Changed
     ports: :3000 -> :3001
     needs: cache -> db
     prepare: npm run build -> npm run build --workspace=@repo/a
+    watch: (none) -> packages/a
     why: package.json script "dev": node --watch main.js --port 3001; needs compose services db
 "#,
     );
@@ -1007,4 +1015,43 @@ fn workspace_patterns_support_exact_paths_and_negations() {
     why: package.json script "dev": vite
 "#,
     ));
+}
+
+const API_PREPARED: &str = r#"schema_version = 1
+root = "{root}"
+
+[services.api]
+runtime = "node"
+path = "apps/api"
+command = "npm run dev"
+prepare = ["npm run build --workspace=@repo/a", "npm run build --workspace=@repo/b"]
+"#;
+
+#[test]
+fn changed_services_show_watch_differences() {
+    let sandbox = Sandbox::new();
+    api_with_workspace_dependencies(&sandbox);
+    sandbox.write_config(API_PREPARED);
+    discover(&sandbox).success().stderr("").stdout(
+        r#"Discovery: 1 service
+
+Changed
+  api  high
+    watch: (none) -> packages/a packages/b
+    why: package.json script "dev": node --watch src/main.js
+"#,
+    );
+}
+
+#[test]
+fn discover_reports_up_to_date_when_watch_dirs_match() {
+    let sandbox = Sandbox::new();
+    api_with_workspace_dependencies(&sandbox);
+    sandbox.write_config(&format!(
+        "{API_PREPARED}watch = [\"packages/b\", \"packages/a\"]\n"
+    ));
+    discover(&sandbox)
+        .success()
+        .stderr("")
+        .stdout("Discovery: 1 service\n\nUp to date\n");
 }

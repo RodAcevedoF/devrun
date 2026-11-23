@@ -219,3 +219,70 @@ fn ports_claimed_by_several_candidates_are_reported_in_port_order() {
         ]
     );
 }
+
+fn dir(raw: &str) -> RelativePath {
+    RelativePath::parse(raw).unwrap()
+}
+
+fn watched(workspace: &RepoWorkspace, raw: &str) -> RepoWorkspace {
+    let mut workspace = workspace.clone();
+    let api = workspace.service(&name(raw)).unwrap().clone();
+    workspace
+        .upsert_service(api.with_watch([dir("packages/a"), dir("packages/b")]))
+        .unwrap();
+    workspace
+}
+
+#[test]
+fn watch_dirs_start_empty_and_are_kept_sorted_and_unique() {
+    assert!(service("api").watch.is_empty());
+    let api =
+        service("api").with_watch([dir("packages/b"), dir("./packages/a/"), dir("packages/b")]);
+    assert_eq!(api.watch, [dir("packages/a"), dir("packages/b")]);
+}
+
+#[test]
+fn candidates_differing_in_watch_dirs_are_changed() {
+    let mut candidates = unchanged_jaspy_candidates();
+    for candidate in &mut candidates {
+        if candidate.service.name.as_str() == "api" {
+            candidate.service.watch = vec![dir("packages/a"), dir("packages/b")];
+        }
+    }
+    let diff = DiscoveryDiff::between(&jaspy_like(), &candidates);
+    let changed: Vec<(&str, bool, bool)> = diff
+        .changed
+        .iter()
+        .map(|change| {
+            (
+                change.current.name.as_str(),
+                change.watch_changed(),
+                change.prepare_changed(),
+            )
+        })
+        .collect();
+    assert_eq!(changed, [("api", true, false)]);
+    assert!(diff.added.is_empty());
+    assert!(diff.missing.is_empty());
+}
+
+#[test]
+fn matching_watch_dirs_are_compared_regardless_of_order() {
+    let workspace = watched(&jaspy_like(), "api");
+    let mut candidates: Vec<Candidate> = workspace
+        .services()
+        .map(|service| candidate(service.clone()))
+        .collect();
+    for candidate in &mut candidates {
+        candidate.service.watch.reverse();
+    }
+    let diff = DiscoveryDiff::between(&workspace, &candidates);
+    assert_eq!(diff, DiscoveryDiff::default());
+}
+
+#[test]
+fn undiscovered_watch_dirs_keep_the_configured_values() {
+    let workspace = watched(&jaspy_like(), "api");
+    let diff = DiscoveryDiff::between(&workspace, &unchanged_jaspy_candidates());
+    assert_eq!(diff, DiscoveryDiff::default());
+}
