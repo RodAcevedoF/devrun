@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::Notify;
 
-use crate::{Event, OutputSource, ServiceId};
+use crate::{Event, OutputSource, ResourceUsage, ServiceId};
 
 const COALESCE_LIMIT: usize = 64 * 1024;
 
@@ -11,6 +11,7 @@ struct Pending {
     events: VecDeque<Event>,
     buffered: HashMap<ServiceId, usize>,
     dropped: BTreeMap<ServiceId, u64>,
+    sampled: HashSet<ServiceId>,
     limit: usize,
     closed: bool,
 }
@@ -26,8 +27,27 @@ impl Pending {
                 source,
                 bytes,
             } => self.push_output(&service, source, bytes),
+            Event::Usage { service, usage } => self.push_usage(service, usage),
             other => self.events.push_back(other),
         }
+    }
+
+    fn push_usage(&mut self, service: ServiceId, usage: ResourceUsage) {
+        if self.sampled.contains(&service) {
+            let pending = self.events.iter_mut().find_map(|event| match event {
+                Event::Usage {
+                    service: owner,
+                    usage: pending,
+                } if *owner == service => Some(pending),
+                _ => None,
+            });
+            if let Some(pending) = pending {
+                *pending = usage;
+                return;
+            }
+        }
+        self.sampled.insert(service.clone());
+        self.events.push_back(Event::Usage { service, usage });
     }
 
     fn push_output(&mut self, service: &ServiceId, source: OutputSource, bytes: Vec<u8>) {
@@ -96,14 +116,24 @@ impl Pending {
         }
         match self.events.pop_front() {
             Some(event) => {
-                if let Event::Output { service, bytes, .. } = &event
-                    && let Some(buffered) = self.buffered.get_mut(service)
-                {
-                    *buffered = buffered.saturating_sub(bytes.len());
-                }
+                self.forget(&event);
                 Some(event)
             }
             None => self.dropped.pop_first().map(drop_notice),
+        }
+    }
+
+    fn forget(&mut self, event: &Event) {
+        match event {
+            Event::Output { service, bytes, .. } => {
+                if let Some(buffered) = self.buffered.get_mut(service) {
+                    *buffered = buffered.saturating_sub(bytes.len());
+                }
+            }
+            Event::Usage { service, .. } => {
+                self.sampled.remove(service);
+            }
+            _ => {}
         }
     }
 
@@ -141,6 +171,7 @@ pub(crate) fn event_queue(limit: usize) -> (Publisher, EventQueue) {
             events: VecDeque::new(),
             buffered: HashMap::new(),
             dropped: BTreeMap::new(),
+            sampled: HashSet::new(),
             limit: limit.max(1),
             closed: false,
         }),
@@ -217,5 +248,62 @@ impl EventQueue {
 
     pub fn try_recv(&self) -> Option<Event> {
         self.shared.lock().pop()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usage(cpu_permille: u32) -> ResourceUsage {
+        ResourceUsage {
+            cpu_permille,
+            rss_bytes: 1024,
+            processes: 1,
+        }
+    }
+
+    fn usage_event(service: &str, cpu_permille: u32) -> Event {
+        Event::Usage {
+            service: ServiceId::new(service),
+            usage: usage(cpu_permille),
+        }
+    }
+
+    fn rejected() -> Event {
+        Event::Rejected {
+            reason: "between".to_owned(),
+        }
+    }
+
+    fn drain(queue: &EventQueue) -> Vec<Event> {
+        std::iter::from_fn(|| queue.try_recv()).collect()
+    }
+
+    #[test]
+    fn a_pending_usage_is_replaced_in_place_by_the_newest_sample() {
+        let (publisher, queue) = event_queue(1024);
+
+        publisher.publish(usage_event("api", 1));
+        publisher.publish(rejected());
+        publisher.publish(usage_event("web", 2));
+        publisher.publish(usage_event("api", 3));
+
+        assert_eq!(
+            drain(&queue),
+            vec![usage_event("api", 3), rejected(), usage_event("web", 2)]
+        );
+    }
+
+    #[test]
+    fn a_delivered_usage_no_longer_absorbs_later_samples() {
+        let (publisher, queue) = event_queue(1024);
+
+        publisher.publish(usage_event("api", 1));
+        assert_eq!(drain(&queue), vec![usage_event("api", 1)]);
+        publisher.publish(rejected());
+        publisher.publish(usage_event("api", 2));
+
+        assert_eq!(drain(&queue), vec![rejected(), usage_event("api", 2)]);
     }
 }

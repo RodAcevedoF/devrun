@@ -38,6 +38,7 @@ pub struct SupervisorOptions {
     pub rows: u16,
     pub cols: u16,
     pub output_buffer_bytes: usize,
+    pub usage_interval: Option<Duration>,
 }
 
 impl Default for SupervisorOptions {
@@ -48,6 +49,7 @@ impl Default for SupervisorOptions {
             rows: 24,
             cols: 80,
             output_buffer_bytes: 1024 * 1024,
+            usage_interval: Some(Duration::from_secs(2)),
         }
     }
 }

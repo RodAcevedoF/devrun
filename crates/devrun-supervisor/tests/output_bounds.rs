@@ -2,11 +2,12 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
 use common::{EVENT_TIMEOUT, Session, id, options, spec};
-use devrun_supervisor::{Command, Event, SupervisorOptions};
+use devrun_supervisor::{Command, Event, ServiceId, SupervisorOptions};
 use tokio::time::{sleep, timeout};
 
 const LIMIT: usize = 64 * 1024;
@@ -109,5 +110,32 @@ async fn a_keeping_up_consumer_receives_every_byte_without_drop_notices() {
             .iter()
             .any(|event| matches!(event, Event::OutputDropped { .. }))
     );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn stalled_consumer_holds_only_the_latest_usage_per_service() {
+    let mut session = Session::start_with(
+        SupervisorOptions {
+            usage_interval: Some(Duration::from_millis(250)),
+            ..options()
+        },
+        |dir| {
+            vec![
+                spec("api", dir, "sleep 1000"),
+                spec("web", dir, "sleep 1000"),
+            ]
+        },
+    );
+    sleep(Duration::from_millis(1500)).await;
+
+    let mut usages: BTreeMap<ServiceId, usize> = BTreeMap::new();
+    while let Some(event) = session.handle.try_recv() {
+        if let Event::Usage { service, .. } = event {
+            *usages.entry(service).or_default() += 1;
+        }
+    }
+
+    assert_eq!(usages, BTreeMap::from([(id("api"), 1), (id("web"), 1)]));
     session.shutdown().await;
 }

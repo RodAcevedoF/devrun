@@ -1,4 +1,4 @@
-use devrun_supervisor::{ServiceState, ServiceStatus};
+use devrun_supervisor::{ResourceUsage, ServiceState, ServiceStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -103,6 +103,34 @@ fn ports_label(ports: &[u16]) -> String {
         .join(" ")
 }
 
+fn live_usage(pane: &Pane, state: &ServiceState) -> Option<ResourceUsage> {
+    pane.usage().filter(|_| status::is_live(state))
+}
+
+fn usage_totals(dashboard: &Dashboard, statuses: &[ServiceStatus]) -> Option<String> {
+    let live: Vec<ResourceUsage> = dashboard
+        .panes()
+        .iter()
+        .filter_map(|pane| live_usage(pane, state_of(pane, statuses)))
+        .collect();
+    if live.is_empty() {
+        return None;
+    }
+    let cpu = live
+        .iter()
+        .map(|usage| usage.cpu_permille)
+        .fold(0, u32::saturating_add);
+    let memory = live
+        .iter()
+        .map(|usage| usage.rss_bytes)
+        .fold(0, u64::saturating_add);
+    Some(format!(
+        "{} cpu · {}",
+        status::cpu_share(cpu),
+        status::memory_size(memory)
+    ))
+}
+
 fn draw_header(frame: &mut Frame, area: Rect, dashboard: &Dashboard, statuses: &[ServiceStatus]) {
     let title = Line::from(vec![
         Span::styled(" devrun", bold().fg(Color::Cyan)),
@@ -115,6 +143,9 @@ fn draw_header(frame: &mut Frame, area: Rect, dashboard: &Dashboard, statuses: &
         status::services_noun(count),
         status::ready_count(statuses)
     );
+    if let Some(totals) = usage_totals(dashboard, statuses) {
+        summary = format!("{summary}· {totals} ");
+    }
     if dashboard.mode() == Mode::Stopping {
         summary = format!("stopping… · {summary}");
     }
@@ -195,6 +226,16 @@ fn pane_title<'a>(pane: &'a Pane, state: &ServiceState) -> Line<'a> {
             dim(),
         ));
     }
+    if let Some(usage) = live_usage(pane, state) {
+        spans.push(Span::styled(
+            format!(
+                " · {} · {}",
+                status::cpu_share(usage.cpu_permille),
+                status::memory_size(usage.rss_bytes)
+            ),
+            dim(),
+        ));
+    }
     spans.push(Span::raw(" "));
     Line::from(spans)
 }
@@ -245,7 +286,7 @@ fn key_help(keys: &[(&'static str, &'static str)]) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use devrun_supervisor::{Event, OutputSource, ServiceId, ServiceState};
+    use devrun_supervisor::{Event, OutputSource, ResourceUsage, ServiceId, ServiceState};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -325,13 +366,91 @@ mod tests {
         panic!("{name} cannot be selected");
     }
 
+    const MIB: u64 = 1024 * 1024;
+
+    fn usage(service: &str, cpu_permille: u32, rss_bytes: u64) -> Event {
+        Event::Usage {
+            service: ServiceId::new(service),
+            usage: ResourceUsage {
+                cpu_permille,
+                rss_bytes,
+                processes: 1,
+            },
+        }
+    }
+
+    fn measured_dashboard() -> Dashboard {
+        let mut dashboard = fixed_dashboard();
+        dashboard.apply(&usage("api", 125, 150 * MIB));
+        dashboard.apply(&usage("web", 75, 50 * MIB));
+        dashboard.apply(&usage("job", 900, 1024 * MIB));
+        dashboard
+    }
+
     #[test]
     fn header_names_the_repo_and_counts_ready_services() {
         let buffer = render(&fixed_dashboard(), &fixed_states());
 
         let header = &rows(&buffer)[0];
         assert!(header.contains("devrun · jaspy-monorepo"), "{header}");
-        assert!(header.contains("6 services · 1 ready"), "{header}");
+        assert!(header.contains("6 services · 1 ready "), "{header}");
+        assert!(!header.contains("cpu"), "{header}");
+    }
+
+    #[test]
+    fn header_totals_usage_over_live_services_only() {
+        let buffer = render(&measured_dashboard(), &fixed_states());
+
+        let header = &rows(&buffer)[0];
+        assert!(
+            header.contains("6 services · 1 ready · 20.0% cpu · 200 MB "),
+            "{header}"
+        );
+    }
+
+    #[test]
+    fn pane_title_shows_the_usage_of_a_live_service() {
+        let mut dashboard = measured_dashboard();
+        let states = fixed_states();
+        select(&mut dashboard, &states, "api");
+
+        let buffer = render(&dashboard, &states);
+
+        find(&buffer, "api · running · 12.5% · 150 MB ");
+    }
+
+    #[test]
+    fn pane_title_shows_ports_before_usage() {
+        let mut dashboard = Dashboard::new(
+            "repo".to_owned(),
+            &[devrun_supervisor::LaunchSpec {
+                ports: vec![3000],
+                ..devrun_supervisor::LaunchSpec::new(ServiceId::new("api"), "/repo", "nest")
+            }],
+            super::super::model::tests::sample_size(),
+        );
+        dashboard.apply(&usage("api", 125, 150 * MIB));
+
+        let buffer = render(
+            &dashboard,
+            &statuses(&[("api", ServiceState::Running { pid: 1 })]),
+        );
+
+        find(&buffer, "api · running · :3000 · 12.5% · 150 MB ");
+    }
+
+    #[test]
+    fn pane_title_hides_the_usage_of_an_ended_service() {
+        let mut dashboard = measured_dashboard();
+        let states = fixed_states();
+        select(&mut dashboard, &states, "job");
+
+        let buffer = render(&dashboard, &states);
+
+        let (_, y) = find(&buffer, "job · exited with code 0");
+        let title = &rows(&buffer)[usize::from(y)];
+        assert!(!title.contains('%'), "{title}");
+        assert!(!title.contains("GB"), "{title}");
     }
 
     #[test]

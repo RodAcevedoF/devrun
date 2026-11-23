@@ -53,10 +53,21 @@ pub enum Event {
         service: ServiceId,
         bytes: u64,
     },
+    Usage {
+        service: ServiceId,
+        usage: ResourceUsage,
+    },
     Rejected {
         reason: String,
     },
     ShutdownComplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    pub cpu_permille: u32,
+    pub rss_bytes: u64,
+    pub processes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

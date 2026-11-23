@@ -37,6 +37,7 @@ pub async fn run(
     let options = SupervisorOptions {
         rows: ROWS,
         cols: COLS,
+        usage_interval: None,
         ..SupervisorOptions::default()
     };
     let mut printer = Printer::new(specs.iter().map(|spec| spec.id.clone()));
@@ -152,7 +153,7 @@ impl Printer {
                 }
                 self.write_note(service, &status::describe(state))
             }
-            Event::Rejected { .. } | Event::ShutdownComplete => Ok(()),
+            Event::Usage { .. } | Event::Rejected { .. } | Event::ShutdownComplete => Ok(()),
         }
     }
 

@@ -5,6 +5,7 @@ use crate::health::HealthProbe;
 use crate::process::{ExitCode, ManagedProcess};
 use crate::queue::Publisher;
 use crate::spec::LaunchPlan;
+use crate::usage::{self, UsageSampler};
 use crate::{
     Command, Event, LaunchSpec, OutputSource, ServiceId, ServiceState, ServiceStatus,
     SupervisorOptions,
@@ -81,6 +82,7 @@ pub(crate) struct Coordinator {
     internal: mpsc::UnboundedReceiver<Internal>,
     next_generation: u64,
     shutting_down: bool,
+    sampler: Option<UsageSampler>,
 }
 
 impl Coordinator {
@@ -110,6 +112,7 @@ impl Coordinator {
         Self {
             slots,
             start_order: plan.start_order,
+            sampler: UsageSampler::new(options.usage_interval),
             size: PtySize {
                 rows: options.rows,
                 cols: options.cols,
@@ -131,6 +134,7 @@ impl Coordinator {
 
     pub async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
         self.reconcile();
+        let mut clock = self.sampler.as_ref().map(UsageSampler::clock);
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
@@ -138,6 +142,7 @@ impl Coordinator {
                     Some(command) => self.handle_command(command),
                 },
                 Some(message) = self.internal.recv() => self.handle_internal(message),
+                () = usage::tick(clock.as_mut()) => self.publish_usage(),
             }
             self.reconcile();
         }
@@ -156,6 +161,32 @@ impl Coordinator {
                 }
             }),
             Command::Shutdown => {}
+        }
+    }
+
+    fn publish_usage(&mut self) {
+        let leaders: Vec<(usize, u32)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(service, slot)| {
+                slot.active
+                    .as_ref()
+                    .map(|active| (service, active.process.pid()))
+            })
+            .collect();
+        let Some(sampler) = &mut self.sampler else {
+            return;
+        };
+        let pids: Vec<u32> = leaders.iter().map(|&(_, pid)| pid).collect();
+        let usages = sampler.sample(&pids);
+        for (&(service, _), usage) in leaders.iter().zip(usages) {
+            if let Some(usage) = usage {
+                self.emit(Event::Usage {
+                    service: self.slots[service].spec.id.clone(),
+                    usage,
+                });
+            }
         }
     }
 

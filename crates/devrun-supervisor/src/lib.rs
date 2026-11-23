@@ -7,8 +7,11 @@ mod process;
 mod queue;
 mod signals;
 mod spec;
+mod usage;
 
-pub use contract::{Command, Event, OutputSource, ServiceId, ServiceState, ServiceStatus};
+pub use contract::{
+    Command, Event, OutputSource, ResourceUsage, ServiceId, ServiceState, ServiceStatus,
+};
 pub use error::SupervisorError;
 pub use handle::{Supervisor, SupervisorHandle};
 pub use signals::TerminationSignals;

@@ -6,7 +6,8 @@ use std::path::Path;
 
 use common::{Session, id, options, spec};
 use devrun_supervisor::{
-    Command, Event, LaunchSpec, OutputSource, ServiceState, ServiceStatus, Supervisor,
+    Command, Event, LaunchSpec, OutputSource, ResourceUsage, ServiceState, ServiceStatus,
+    Supervisor,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -129,6 +130,14 @@ fn events_round_trip_through_json() {
         Event::OutputDropped {
             service: id("api"),
             bytes: 65_536,
+        },
+        Event::Usage {
+            service: id("api"),
+            usage: ResourceUsage {
+                cpu_permille: 1_250,
+                rss_bytes: 157_286_400,
+                processes: 3,
+            },
         },
         Event::Rejected {
             reason: "unknown service `ghost`".to_owned(),

@@ -1,5 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use devrun_supervisor::{Command, Event, LaunchSpec, ServiceId, ServiceState, ServiceStatus};
+use devrun_supervisor::{
+    Command, Event, LaunchSpec, ResourceUsage, ServiceId, ServiceState, ServiceStatus,
+};
 use tui_term::vt100;
 
 use super::super::status;
@@ -26,9 +28,14 @@ pub struct Pane {
     pub id: ServiceId,
     pub ports: Vec<u16>,
     terminal: vt100::Parser,
+    usage: Option<ResourceUsage>,
 }
 
 impl Pane {
+    pub fn usage(&self) -> Option<ResourceUsage> {
+        self.usage
+    }
+
     pub fn screen(&self) -> &vt100::Screen {
         self.terminal.screen()
     }
@@ -54,6 +61,7 @@ impl Dashboard {
                 id: spec.id.clone(),
                 ports: spec.ports.clone(),
                 terminal: vt100::Parser::new(size.rows, size.cols, SCROLLBACK_LINES),
+                usage: None,
             })
             .collect();
         Self {
@@ -99,7 +107,19 @@ impl Dashboard {
                     pane.terminal.process(notice.as_bytes());
                 }
             }
-            Event::State { .. } | Event::Rejected { .. } | Event::ShutdownComplete => {}
+            Event::Usage { service, usage } => {
+                if let Some(pane) = self.pane_mut(service) {
+                    pane.usage = Some(*usage);
+                }
+            }
+            Event::State { service, state } => {
+                if !status::is_live(state)
+                    && let Some(pane) = self.pane_mut(service)
+                {
+                    pane.usage = None;
+                }
+            }
+            Event::Rejected { .. } | Event::ShutdownComplete => {}
         }
     }
 
@@ -235,7 +255,7 @@ fn character_bytes(character: char, modifiers: KeyModifiers) -> Vec<u8> {
 
 #[cfg(test)]
 pub mod tests {
-    use devrun_supervisor::OutputSource;
+    use devrun_supervisor::{OutputSource, ResourceUsage};
 
     use super::*;
 
@@ -412,6 +432,49 @@ pub mod tests {
         });
 
         assert!(screen_text(&dashboard).contains("4096 bytes of output dropped"));
+    }
+
+    fn usage(service: &str, cpu_permille: u32) -> Event {
+        Event::Usage {
+            service: ServiceId::new(service),
+            usage: ResourceUsage {
+                cpu_permille,
+                rss_bytes: 4096,
+                processes: 2,
+            },
+        }
+    }
+
+    #[test]
+    fn usage_is_kept_per_pane_and_replaced_by_newer_samples() {
+        let mut dashboard = dashboard_for(&["db", "api"]);
+
+        dashboard.apply(&usage("api", 10));
+        dashboard.apply(&usage("api", 30));
+
+        assert_eq!(dashboard.panes()[0].usage(), None);
+        assert_eq!(
+            dashboard.panes()[1].usage().map(|usage| usage.cpu_permille),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn usage_is_forgotten_once_the_service_is_no_longer_live() {
+        let mut dashboard = dashboard_for(&["api"]);
+        dashboard.apply(&usage("api", 10));
+
+        dashboard.apply(&Event::State {
+            service: ServiceId::new("api"),
+            state: ServiceState::Ready { pid: 1 },
+        });
+        assert!(dashboard.panes()[0].usage().is_some());
+        dashboard.apply(&Event::State {
+            service: ServiceId::new("api"),
+            state: ServiceState::Stopping,
+        });
+
+        assert_eq!(dashboard.panes()[0].usage(), None);
     }
 
     #[test]
