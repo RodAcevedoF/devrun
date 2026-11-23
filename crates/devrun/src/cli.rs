@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 use crate::app::App;
-use crate::slices::{catalog, config, plan};
+use crate::slices::{catalog, config, discover, plan};
 use crate::ui;
 
 #[derive(Parser)]
@@ -31,6 +31,8 @@ enum Command {
     Ls,
     #[command(about = "Show what would start, in order, without starting anything")]
     Plan(TargetArgs),
+    #[command(about = "Scan the repository for services and compare them with the config")]
+    Discover,
     #[command(subcommand, about = "Inspect devrun's own configuration")]
     Config(ConfigCommand),
 }
@@ -69,6 +71,7 @@ fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Ls => catalog::list(&app),
         Command::Plan(args) => plan::show(&app, &args.targets),
+        Command::Discover => discover::show(&app),
         Command::Config(ConfigCommand::Path) => {
             config::path(&app);
             Ok(())

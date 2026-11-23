@@ -1,0 +1,5 @@
+{
+  "name": "jaspy-frontend",
+  "scripts": { "dev": "vite", "build": "vite build" },
+  "dependencies": { "@repo/ui": "*" }
+}

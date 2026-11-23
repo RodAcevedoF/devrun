@@ -1,5 +1,6 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,6 +26,28 @@ impl Sandbox {
             root,
             config,
         }
+    }
+
+    pub fn from_fixture(name: &str) -> Self {
+        let sandbox = Self::new();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        copy_tree(&fixture, &sandbox.root);
+        sandbox
+    }
+
+    pub fn write(&self, relative: &str, contents: &str) -> &Self {
+        let path = self.root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        self
+    }
+
+    pub fn snapshot(&self) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = BTreeMap::new();
+        collect_files(&self.root, &self.root, &mut files);
+        files
     }
 
     pub fn root(&self) -> &Path {
@@ -68,6 +91,32 @@ impl Sandbox {
 
     pub fn write_jaspy_config(&self) -> PathBuf {
         self.write_config(JASPY_CONFIG)
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) {
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            fs::create_dir_all(&target).unwrap();
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn collect_files(root: &Path, dir: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+    for entry in fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        let relative = path.strip_prefix(root).unwrap().to_path_buf();
+        if path.is_dir() {
+            files.insert(relative, Vec::new());
+            collect_files(root, &path, files);
+        } else {
+            files.insert(relative, fs::read(&path).unwrap());
+        }
     }
 }
 

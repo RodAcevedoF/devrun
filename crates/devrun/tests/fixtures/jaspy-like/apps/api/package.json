@@ -1,0 +1,9 @@
+{
+  "name": "jaspy-backend",
+  "scripts": { "build": "nest build", "dev": "nest start --watch" },
+  "dependencies": {
+    "@nestjs/core": "^10.0.0",
+    "@repo/plaid-sync-core": "*",
+    "@repo/company-enrichment-core": "*"
+  }
+}

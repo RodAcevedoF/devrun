@@ -1,3 +1,4 @@
+mod discovery;
 mod error;
 mod identifier;
 mod plan;
@@ -7,6 +8,7 @@ mod suggest;
 mod target;
 mod workspace;
 
+pub use discovery::{Candidate, Change, Confidence, DiscoveryDiff, SharedPort, shared_ports};
 pub use error::DomainError;
 pub use identifier::{AliasName, ProfileName, ServiceName};
 pub use plan::{PlanReason, PlannedService, RunPlan, SkippedNeed};

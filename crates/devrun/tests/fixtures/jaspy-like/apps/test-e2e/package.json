@@ -1,0 +1,1 @@
+{ "name": "test-e2e", "scripts": { "test": "playwright test" } }

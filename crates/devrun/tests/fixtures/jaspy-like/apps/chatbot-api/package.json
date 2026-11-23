@@ -1,0 +1,1 @@
+{ "name": "chatbot-api", "scripts": { "dev": "tsc --watch & node --watch dist/index.js" } }

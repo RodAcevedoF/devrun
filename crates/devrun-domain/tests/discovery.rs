@@ -1,0 +1,147 @@
+#![allow(clippy::unwrap_used)]
+
+mod common;
+
+use common::{jaspy_like, name, port, root, service};
+use devrun_domain::{
+    Candidate, CommandLine, Confidence, DiscoveryDiff, RelativePath, RepoWorkspace, Runtime,
+    Service, SharedPort, shared_ports,
+};
+
+fn candidate(service: Service) -> Candidate {
+    Candidate::new(
+        service,
+        Confidence::High,
+        "package.json script \"dev\": vite",
+    )
+}
+
+fn names(candidates: &[Candidate]) -> Vec<&str> {
+    candidates
+        .iter()
+        .map(|candidate| candidate.service.name.as_str())
+        .collect()
+}
+
+fn unchanged_jaspy_candidates() -> Vec<Candidate> {
+    jaspy_like()
+        .services()
+        .map(|service| candidate(service.clone()))
+        .collect()
+}
+
+#[test]
+fn confidence_is_displayed_in_lowercase() {
+    let shown: Vec<String> = [Confidence::High, Confidence::Medium, Confidence::Low]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(shown, ["high", "medium", "low"]);
+}
+
+#[test]
+fn candidates_matching_the_config_produce_an_empty_diff() {
+    let diff = DiscoveryDiff::between(&jaspy_like(), &unchanged_jaspy_candidates());
+    assert!(diff.is_empty());
+    assert_eq!(diff, DiscoveryDiff::default());
+}
+
+#[test]
+fn unknown_candidates_are_added_sorted_by_name() {
+    let mut candidates = unchanged_jaspy_candidates();
+    candidates.insert(0, candidate(service("worker")));
+    candidates.push(candidate(service("brief")));
+    let diff = DiscoveryDiff::between(&jaspy_like(), &candidates);
+    assert_eq!(names(&diff.added), ["brief", "worker"]);
+    assert!(diff.changed.is_empty());
+    assert!(diff.missing.is_empty());
+    assert!(!diff.is_empty());
+}
+
+#[test]
+fn candidates_differing_in_runtime_path_or_command_are_changed() {
+    let mut candidates = unchanged_jaspy_candidates();
+    for candidate in &mut candidates {
+        match candidate.service.name.as_str() {
+            "web" => candidate.service.command = CommandLine::parse("npm run start").unwrap(),
+            "api" => candidate.service.path = RelativePath::parse("apps/backend").unwrap(),
+            "mongo" => candidate.service.runtime = Runtime::Compose,
+            "neo4j" => candidate.service.ports = vec![port(7474)],
+            _ => {}
+        }
+    }
+    let diff = DiscoveryDiff::between(&jaspy_like(), &candidates);
+    let changed: Vec<(&str, &str)> = diff
+        .changed
+        .iter()
+        .map(|change| {
+            (
+                change.current.name.as_str(),
+                change.candidate.service.name.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        changed,
+        [("api", "api"), ("mongo", "mongo"), ("web", "web")]
+    );
+    let web = &diff.changed[2];
+    assert_eq!(web.current.command.as_str(), "npm run dev");
+    assert_eq!(web.candidate.service.command.as_str(), "npm run start");
+    assert!(diff.added.is_empty());
+    assert!(diff.missing.is_empty());
+}
+
+#[test]
+fn configured_services_not_discovered_are_missing_except_custom_ones() {
+    let mut workspace = jaspy_like();
+    workspace
+        .upsert_service(Service::new(
+            name("tunnel"),
+            Runtime::Custom,
+            RelativePath::repository_root(),
+            CommandLine::parse("ngrok http 3000").unwrap(),
+        ))
+        .unwrap();
+    let candidates: Vec<Candidate> = unchanged_jaspy_candidates()
+        .into_iter()
+        .filter(|candidate| !["web", "neo4j"].contains(&candidate.service.name.as_str()))
+        .collect();
+    let diff = DiscoveryDiff::between(&workspace, &candidates);
+    assert_eq!(diff.missing, [name("neo4j"), name("web")]);
+    assert!(diff.added.is_empty());
+    assert!(diff.changed.is_empty());
+}
+
+#[test]
+fn an_empty_workspace_reports_every_candidate_as_added() {
+    let workspace = RepoWorkspace::new(root()).unwrap();
+    let diff = DiscoveryDiff::between(&workspace, &unchanged_jaspy_candidates());
+    assert_eq!(
+        names(&diff.added),
+        ["api", "knowledge-graph", "mongo", "neo4j", "web"]
+    );
+}
+
+#[test]
+fn ports_claimed_by_several_candidates_are_reported_in_port_order() {
+    let candidates = [
+        candidate(service("research").with_ports([port(8080)])),
+        candidate(service("graph").with_ports([port(8080), port(3000)])),
+        candidate(service("feeder").with_ports([port(3000)])),
+        candidate(service("web").with_ports([port(5173)])),
+    ];
+    assert_eq!(
+        shared_ports(&candidates),
+        [
+            SharedPort {
+                port: port(3000),
+                services: vec![name("feeder"), name("graph")],
+            },
+            SharedPort {
+                port: port(8080),
+                services: vec![name("graph"), name("research")],
+            },
+        ]
+    );
+}
