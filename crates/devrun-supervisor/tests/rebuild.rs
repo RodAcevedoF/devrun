@@ -11,7 +11,9 @@ const HELD_WHEN_FLAGGED: &str = "echo build >> builds.log; if [ -f hold ]; then 
 const CRASHES_ON_REQUEST: &str = "while [ ! -f crash ]; do sleep 0.02; done; rm crash; exit 3";
 const HANGS_ONCE_WHEN_FLAGGED: &str =
     "if [ -f hang ]; then rm hang; echo $$ > rebuild.pid; sleep 1000; fi";
-const WINDS_DOWN_SLOWLY_ONCE_WHEN_FLAGGED: &str = "if [ -f trap ]; then rm trap; trap 'while [ ! -f release ]; do sleep 0.02; done; exit 1' TERM; echo $$ > rebuild.pid; while :; do sleep 0.02; done; fi; echo build >> builds.log";
+const RECORDS_OVERLAP_AND_WINDS_DOWN_SLOWLY_ONCE_WHEN_FLAGGED: &str = "if [ -f rebuild.pid ] && kill -0 $(cat rebuild.pid) 2>/dev/null; then echo overlap >> overlaps.log; fi; if [ -f trap ]; then rm trap; trap 'sleep 0.5; exit 1' TERM; echo $$ > rebuild.pid; while :; do sleep 0.02; done; fi; echo build >> builds.log";
+const NICENESS_WITHOUT_SERVICE_PATH: &str =
+    "echo build >> builds.log; /bin/ps -o nice= -p $$ > nice.txt";
 const FAILS_WHEN_BROKEN: &str = "echo build >> builds.log; if [ -f broken ]; then exit 4; fi";
 const CRASHES_LEAVING_A_STUBBORN_CHILD: &str = "(trap '' TERM HUP; while kill -0 $$ 2>/dev/null; do sleep 0.02; done; touch leader-gone; while :; do sleep 0.02; done) & while [ ! -f crash ]; do sleep 0.02; done; rm crash; exit 3";
 
@@ -465,69 +467,111 @@ async fn starting_a_service_that_crashed_mid_rebuild_cancels_the_rebuild_and_sta
 }
 
 #[tokio::test]
-async fn starting_a_running_service_cancels_its_rebuild_and_keeps_it_running() {
-    let mut session = Session::start(|dir| vec![prepared("api", dir, &[HANGS_ONCE_WHEN_FLAGGED])]);
-    let pid = session.until_running("api").await;
-    std::fs::write(session.path("hang"), "").unwrap();
+async fn starting_a_serving_service_keeps_its_rebuild_running_and_restarts_it_once_rebuilt() {
+    let mut session = Session::start(|dir| vec![prepared("api", dir, &[HELD_WHEN_FLAGGED])]);
+    let first = session.until_running("api").await;
+    std::fs::write(session.path("hold"), "").unwrap();
     session.send(Command::Rebuild(id("api")));
     until_rebuild(&mut session, "api", is_running).await;
-    let rebuild = wait_for_pid(&session, "rebuild.pid").await;
 
     session.send(Command::Start(id("api")));
-    wait_until_gone(&rebuild).await;
+    session.fence().await;
+    std::fs::write(session.path("release"), "").unwrap();
+    until_rebuild(&mut session, "api", is_succeeded).await;
+    let second = session.until_running("api").await;
     session.fence().await;
 
+    assert_ne!(first, second);
+    assert_eq!(line_count(&session, "builds.log"), 2);
+    assert_eq!(
+        rebuild_progress(&session, "api"),
+        [
+            RebuildProgress::Running { step: 1, total: 1 },
+            RebuildProgress::Succeeded
+        ]
+    );
+    let restarts = session
+        .states_of("api")
+        .iter()
+        .filter(|state| **state == ServiceState::Stopping)
+        .count();
+    assert_eq!(restarts, 1);
+    assert_eq!(
+        session.handle.snapshot()[0].state,
+        ServiceState::Running { pid: second }
+    );
+    session.shutdown().await;
+}
+
+async fn cancel_a_rebuild_that_winds_down_slowly(session: &mut Session) -> Vec<u32> {
+    session.until_running("api").await;
+    std::fs::write(session.path("trap"), "").unwrap();
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(session, "api", is_running).await;
+    let cancelled = wait_for_pid(session, "rebuild.pid").await;
+    session.send(Command::Restart(id("api")));
+    session
+        .until_state("api", |state| {
+            matches!(state, ServiceState::Preparing { .. })
+        })
+        .await;
+    cancelled
+}
+
+fn slow_wind_down_session() -> Session {
+    let options = devrun_supervisor::SupervisorOptions {
+        grace_period: std::time::Duration::from_secs(5),
+        ..common::options()
+    };
+    Session::start_with(options, |dir| {
+        vec![prepared(
+            "api",
+            dir,
+            &[RECORDS_OVERLAP_AND_WINDS_DOWN_SLOWLY_ONCE_WHEN_FLAGGED],
+        )]
+    })
+}
+
+#[tokio::test]
+async fn no_prepare_starts_until_the_cancelled_rebuild_has_wound_down_and_a_rebuild_requested_meanwhile_is_kept()
+ {
+    let mut session = slow_wind_down_session();
+    let cancelled = cancel_a_rebuild_that_winds_down_slowly(&mut session).await;
+    assert!(common::process_exists(cancelled[0]));
+
+    session.send(Command::Rebuild(id("api")));
+    let restarted = session.until_running("api").await;
+    assert!(!common::process_exists(cancelled[0]));
+    session.fence().await;
+
+    assert!(!session.path("overlaps.log").exists());
+    assert_eq!(line_count(&session, "builds.log"), 2);
     assert_eq!(
         rebuild_progress(&session, "api"),
         [RebuildProgress::Running { step: 1, total: 1 }]
     );
     assert_eq!(
         session.handle.snapshot()[0].state,
-        ServiceState::Running { pid }
+        ServiceState::Running { pid: restarted }
     );
     session.shutdown().await;
 }
 
 #[tokio::test]
-async fn a_rebuild_requested_while_a_cancelled_rebuild_winds_down_runs_and_restarts_the_service() {
-    let options = devrun_supervisor::SupervisorOptions {
-        grace_period: std::time::Duration::from_secs(5),
-        ..common::options()
-    };
-    let mut session = Session::start_with(options, |dir| {
-        vec![prepared("api", dir, &[WINDS_DOWN_SLOWLY_ONCE_WHEN_FLAGGED])]
-    });
-    session.until_running("api").await;
-    std::fs::write(session.path("trap"), "").unwrap();
-    session.send(Command::Rebuild(id("api")));
-    until_rebuild(&mut session, "api", is_running).await;
-    let cancelled = wait_for_pid(&session, "rebuild.pid").await;
+async fn stopping_a_service_whose_prepare_waits_for_a_wind_down_never_runs_that_prepare() {
+    let mut session = slow_wind_down_session();
+    let cancelled = cancel_a_rebuild_that_winds_down_slowly(&mut session).await;
 
-    session.send(Command::Restart(id("api")));
-    let restarted = session.until_running("api").await;
-    assert!(common::process_exists(cancelled[0]));
-    session.send(Command::Rebuild(id("api")));
-    until_rebuild(&mut session, "api", is_running).await;
-    std::fs::write(session.path("release"), "").unwrap();
-    until_rebuild(&mut session, "api", is_succeeded).await;
-    let rebuilt = session.until_running("api").await;
+    session.send(Command::Stop(id("api")));
+    session
+        .until_state("api", |state| *state == ServiceState::Stopped)
+        .await;
     wait_until_gone(&cancelled).await;
     session.fence().await;
 
-    assert_ne!(restarted, rebuilt);
-    assert_eq!(line_count(&session, "builds.log"), 3);
-    assert_eq!(
-        rebuild_progress(&session, "api"),
-        [
-            RebuildProgress::Running { step: 1, total: 1 },
-            RebuildProgress::Running { step: 1, total: 1 },
-            RebuildProgress::Succeeded
-        ]
-    );
-    assert_eq!(
-        session.handle.snapshot()[0].state,
-        ServiceState::Running { pid: rebuilt }
-    );
+    assert_eq!(session.handle.snapshot()[0].state, ServiceState::Stopped);
+    assert_eq!(line_count(&session, "builds.log"), 1);
+    assert!(!session.path("overlaps.log").exists());
     session.shutdown().await;
 }
 
@@ -567,7 +611,7 @@ async fn a_failed_rebuild_makes_the_next_restart_prepare_again_instead_of_starti
 async fn rebuild_runs_niced_even_when_the_service_path_has_no_nice() {
     let mut session = Session::start(|dir| {
         let mut service = LaunchSpec {
-            prepare: vec!["echo build >> builds.log".to_owned()],
+            prepare: vec![NICENESS_WITHOUT_SERVICE_PATH.to_owned()],
             ..spec("api", dir, "exec /bin/sleep 1000")
         };
         service
@@ -590,6 +634,12 @@ async fn rebuild_runs_niced_even_when_the_service_path_has_no_nice() {
 
     assert_ne!(first, second);
     assert_eq!(line_count(&session, "builds.log"), 2);
+    assert_eq!(
+        std::fs::read_to_string(session.path("nice.txt"))
+            .unwrap()
+            .trim(),
+        "10"
+    );
     session.shutdown().await;
 }
 

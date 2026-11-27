@@ -1,11 +1,14 @@
-use super::{Coordinator, Phase};
+use super::{Coordinator, Phase, PrepareStart};
 use crate::prepare::{self, PrepareEnd, PrepareOutcome, RerunRequest};
 use crate::process::{ExitCode, Priority};
 use crate::rebuild::{self, RebuildRequest, RebuildRun, ServiceProcess, StepEnd};
-use crate::{Event, OutputSource, RebuildProgress};
+use crate::{Event, OutputSource, RebuildProgress, ServiceState};
 
 impl Coordinator {
     pub(super) fn rebuild(&mut self, service: usize) {
+        if self.slots[service].awaiting_wind_down.is_some() {
+            return;
+        }
         if let Some(run) = &mut self.slots[service].rebuild {
             run.request_rerun();
             return;
@@ -23,8 +26,18 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn cancel_rebuild_unless_serving(&mut self, service: usize) {
+        match self.service_process(service) {
+            ServiceProcess::Serving => {}
+            ServiceProcess::NotServing => self.cancel_rebuild(service),
+        }
+    }
+
     pub(super) fn cancel_rebuild(&mut self, service: usize) {
-        let Some(run) = self.slots[service].rebuild.take() else {
+        let slot = &mut self.slots[service];
+        slot.awaiting_wind_down
+            .take_if(|start| *start == PrepareStart::Rebuild);
+        let Some(run) = slot.rebuild.take() else {
             return;
         };
         let (winding_down, terminator) = run.cancel();
@@ -58,9 +71,48 @@ impl Coordinator {
     }
 
     pub(super) fn rebuild_wound_down(&mut self, service: usize, generation: u64) {
-        self.slots[service]
-            .winding_down
+        let slot = &mut self.slots[service];
+        slot.winding_down
             .retain(|run| run.generation() != generation);
+        if slot.winding_down.is_empty()
+            && let Some(start) = slot.awaiting_wind_down.take()
+        {
+            self.launch_prepare(service, start);
+        }
+    }
+
+    pub(super) fn start_prepare(&mut self, service: usize, start: PrepareStart) {
+        if self.slots[service].winding_down.is_empty() {
+            self.launch_prepare(service, start);
+        } else {
+            self.announce_awaited_prepare(service, start);
+            self.slots[service].awaiting_wind_down = Some(start);
+        }
+    }
+
+    fn launch_prepare(&mut self, service: usize, start: PrepareStart) {
+        match start {
+            PrepareStart::FirstPrepare => self.launch(service, Phase::Prepare { step: 0 }),
+            PrepareStart::Rebuild => {
+                self.launch_rebuild_step(service, 0, RerunRequest::NotRequested);
+            }
+        }
+    }
+
+    fn announce_awaited_prepare(&mut self, service: usize, start: PrepareStart) {
+        match start {
+            PrepareStart::FirstPrepare => {
+                let total = self.slots[service].spec.prepare.len();
+                self.set_state(
+                    service,
+                    ServiceState::Preparing {
+                        step: prepare::step_number(0),
+                        total,
+                    },
+                );
+            }
+            PrepareStart::Rebuild => {}
+        }
     }
 
     fn service_process(&self, service: usize) -> ServiceProcess {
@@ -79,7 +131,7 @@ impl Coordinator {
         if self.slots[service].spec.prepare.is_empty() {
             self.rebuild_ended(service, PrepareEnd::Report(PrepareOutcome::Succeeded));
         } else {
-            self.launch_rebuild_step(service, 0, RerunRequest::NotRequested);
+            self.start_prepare(service, PrepareStart::Rebuild);
         }
     }
 

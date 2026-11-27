@@ -17,20 +17,17 @@ use crate::{
 };
 
 #[derive(Clone, Copy)]
-enum Internal {
-    LeaderExited {
-        service: usize,
-        generation: u64,
-    },
-    GroupGone {
-        service: usize,
-        generation: u64,
-        code: ExitCode,
-    },
-    PortsReady {
-        service: usize,
-        generation: u64,
-    },
+struct Internal {
+    service: usize,
+    generation: u64,
+    event: ProcessEvent,
+}
+
+#[derive(Clone, Copy)]
+enum ProcessEvent {
+    LeaderExited,
+    GroupGone { code: ExitCode },
+    PortsReady,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +36,12 @@ enum Owner {
     Rebuild,
     WindingDownRebuild,
     Nobody,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrepareStart {
+    FirstPrepare,
+    Rebuild,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,6 +82,7 @@ struct Slot {
     active: Option<Active>,
     rebuild: Option<RebuildRun>,
     winding_down: Vec<WindingDown>,
+    awaiting_wind_down: Option<PrepareStart>,
 }
 
 impl Slot {
@@ -142,6 +146,7 @@ impl Coordinator {
                 active: None,
                 rebuild: None,
                 winding_down: Vec::new(),
+                awaiting_wind_down: None,
             })
             .collect();
         let statuses = slots
@@ -195,7 +200,10 @@ impl Coordinator {
 
     fn handle_command(&mut self, command: Command) {
         match command {
-            Command::Start(id) => self.with_rebuild_cancelled(&id, Self::request_start),
+            Command::Start(id) => self.with_service(&id, |this, service| {
+                this.cancel_rebuild_unless_serving(service);
+                this.request_start(service);
+            }),
             Command::Stop(id) => {
                 self.with_rebuild_cancelled(&id, |this, service| this.stop(service, false));
             }
@@ -254,32 +262,25 @@ impl Coordinator {
     }
 
     fn handle_internal(&mut self, message: Internal) {
-        match message {
-            Internal::LeaderExited {
-                service,
-                generation,
-            } => match self.slots[service].owner(generation) {
-                Owner::Service => self.leader_exited(service),
-                Owner::Rebuild => self.rebuild_leader_exited(service),
-                Owner::WindingDownRebuild | Owner::Nobody => {}
-            },
-            Internal::GroupGone {
-                service,
-                generation,
-                code,
-            } => match self.slots[service].owner(generation) {
-                Owner::Service => self.group_gone(service, code),
-                Owner::Rebuild => self.rebuild_group_gone(service, code),
-                Owner::WindingDownRebuild => self.rebuild_wound_down(service, generation),
-                Owner::Nobody => {}
-            },
-            Internal::PortsReady {
-                service,
-                generation,
-            } => match self.slots[service].owner(generation) {
-                Owner::Service => self.ports_ready(service),
-                Owner::Rebuild | Owner::WindingDownRebuild | Owner::Nobody => {}
-            },
+        let Internal {
+            service,
+            generation,
+            event,
+        } = message;
+        match (self.slots[service].owner(generation), event) {
+            (Owner::Service, ProcessEvent::LeaderExited) => self.leader_exited(service),
+            (Owner::Service, ProcessEvent::GroupGone { code }) => self.group_gone(service, code),
+            (Owner::Service, ProcessEvent::PortsReady) => self.ports_ready(service),
+            (Owner::Rebuild, ProcessEvent::LeaderExited) => self.rebuild_leader_exited(service),
+            (Owner::Rebuild, ProcessEvent::GroupGone { code }) => {
+                self.rebuild_group_gone(service, code);
+            }
+            (Owner::WindingDownRebuild, ProcessEvent::GroupGone { .. }) => {
+                self.rebuild_wound_down(service, generation);
+            }
+            (Owner::Rebuild | Owner::WindingDownRebuild, ProcessEvent::PortsReady)
+            | (Owner::WindingDownRebuild, ProcessEvent::LeaderExited)
+            | (Owner::Nobody, _) => {}
         }
     }
 
@@ -318,9 +319,10 @@ impl Coordinator {
             self.size,
             move |bytes| output.send(bytes),
             move || {
-                let _ = exit.send(Internal::LeaderExited {
+                let _ = exit.send(Internal {
                     service,
                     generation,
+                    event: ProcessEvent::LeaderExited,
                 });
             },
         )
@@ -331,10 +333,10 @@ impl Coordinator {
         let gone = self.internal_sender.clone();
         tokio::spawn(async move {
             let code = terminator.terminate(grace_period).await;
-            let _ = gone.send(Internal::GroupGone {
+            let _ = gone.send(Internal {
                 service,
                 generation,
-                code,
+                event: ProcessEvent::GroupGone { code },
             });
         });
     }

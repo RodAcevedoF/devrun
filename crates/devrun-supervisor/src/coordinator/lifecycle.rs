@@ -1,4 +1,4 @@
-use super::{Active, Coordinator, Ending, Internal, Phase};
+use super::{Active, Coordinator, Ending, Internal, Phase, PrepareStart, ProcessEvent};
 use crate::health::HealthProbe;
 use crate::prepare::{self, PrepareEnd, PrepareOutcome, RerunRequest, StepOutcome};
 use crate::process::{ExitCode, ExitWording, ManagedProcess, Priority, describe_exit};
@@ -33,8 +33,13 @@ impl Coordinator {
     }
 
     pub(super) fn stop(&mut self, service: usize, then_start: bool) {
-        self.slots[service].rebuild_during_first_prepare = RerunRequest::NotRequested;
-        if matches!(self.slots[service].state, ServiceState::Waiting { .. }) {
+        let slot = &mut self.slots[service];
+        slot.rebuild_during_first_prepare = RerunRequest::NotRequested;
+        let prepare_not_started = slot
+            .awaiting_wind_down
+            .take_if(|start| *start == PrepareStart::FirstPrepare)
+            .is_some();
+        if prepare_not_started || matches!(slot.state, ServiceState::Waiting { .. }) {
             self.set_state(service, ServiceState::Stopped);
             return;
         }
@@ -106,11 +111,11 @@ impl Coordinator {
         if slot.prepared || slot.spec.prepare.is_empty() {
             self.launch(service, Phase::Service);
         } else {
-            self.launch(service, Phase::Prepare { step: 0 });
+            self.start_prepare(service, PrepareStart::FirstPrepare);
         }
     }
 
-    fn launch(&mut self, service: usize, phase: Phase) {
+    pub(super) fn launch(&mut self, service: usize, phase: Phase) {
         if self.shutting_down {
             self.set_state(service, ServiceState::Stopped);
             return;
@@ -158,9 +163,10 @@ impl Coordinator {
         let health = (phase == Phase::Service && !ports.is_empty()).then(|| {
             let ready = self.internal_sender.clone();
             HealthProbe::spawn(ports.clone(), self.options.health_interval, move || {
-                let _ = ready.send(Internal::PortsReady {
+                let _ = ready.send(Internal {
                     service,
                     generation,
+                    event: ProcessEvent::PortsReady,
                 });
             })
         });
@@ -230,7 +236,9 @@ impl Coordinator {
 
     fn first_prepare_ended(&mut self, service: usize, end: PrepareEnd) {
         match end {
-            PrepareEnd::RerunFromFirstStep => self.launch(service, Phase::Prepare { step: 0 }),
+            PrepareEnd::RerunFromFirstStep => {
+                self.start_prepare(service, PrepareStart::FirstPrepare);
+            }
             PrepareEnd::Report(PrepareOutcome::Succeeded) => {
                 self.slots[service].prepared = true;
                 self.launch(service, Phase::Service);

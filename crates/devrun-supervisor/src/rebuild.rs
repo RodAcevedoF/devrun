@@ -55,7 +55,7 @@ pub(crate) struct RebuildRun {
 
 pub(crate) struct WindingDown {
     generation: u64,
-    _process: ManagedProcess,
+    _owned_until_its_group_is_reaped: ManagedProcess,
 }
 
 impl WindingDown {
@@ -97,7 +97,7 @@ impl RebuildRun {
         };
         let winding_down = WindingDown {
             generation: self.generation,
-            _process: self.process,
+            _owned_until_its_group_is_reaped: self.process,
         };
         (winding_down, terminator)
     }

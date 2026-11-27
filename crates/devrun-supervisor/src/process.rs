@@ -1,6 +1,8 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
@@ -18,7 +20,8 @@ const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const KILL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_BUFFER_SIZE: usize = 8192;
 const LOW_PRIORITY_NICENESS: &str = "10";
-const NICE: &str = "/usr/bin/nice";
+const NICE: &str = "nice";
+const EXECUTABLE_BITS: u32 = 0o111;
 const SHELL: &str = "/bin/sh";
 
 pub(crate) type ExitCode = Option<i32>;
@@ -27,6 +30,32 @@ pub(crate) type ExitCode = Option<i32>;
 pub(crate) enum Priority {
     Normal,
     Low,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Launcher {
+    Niced(PathBuf),
+    Direct,
+}
+
+fn low_priority_launcher(search_path: Option<&OsStr>) -> Launcher {
+    search_path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(NICE))
+        .find(|candidate| is_executable(candidate))
+        .map_or(Launcher::Direct, Launcher::Niced)
+}
+
+fn is_executable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| {
+        metadata.is_file() && metadata.permissions().mode() & EXECUTABLE_BITS != 0
+    })
+}
+
+fn supervisor_low_priority_launcher() -> &'static Launcher {
+    static LAUNCHER: OnceLock<Launcher> = OnceLock::new();
+    LAUNCHER.get_or_init(|| low_priority_launcher(std::env::var_os("PATH").as_deref()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -193,10 +222,14 @@ fn shell_command(
             spec.cwd.display()
         ));
     }
-    let mut builder = match priority {
-        Priority::Normal => CommandBuilder::new(SHELL),
-        Priority::Low => {
-            let mut niced = CommandBuilder::new(NICE);
+    let launcher = match priority {
+        Priority::Normal => &Launcher::Direct,
+        Priority::Low => supervisor_low_priority_launcher(),
+    };
+    let mut builder = match launcher {
+        Launcher::Direct => CommandBuilder::new(SHELL),
+        Launcher::Niced(nice) => {
+            let mut niced = CommandBuilder::new(nice);
             niced.args(["-n", LOW_PRIORITY_NICENESS, SHELL]);
             niced
         }
@@ -299,6 +332,32 @@ mod tests {
         assert_eq!(
             single_line("Unable to spawn nice because:\n  No viable candidates found.\n\nnone\n"),
             "Unable to spawn nice because: No viable candidates found. none"
+        );
+    }
+
+    #[test]
+    fn a_search_path_without_nice_falls_back_to_normal_priority() {
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(
+            low_priority_launcher(Some(empty.path().as_os_str())),
+            Launcher::Direct
+        );
+        assert_eq!(low_priority_launcher(None), Launcher::Direct);
+    }
+
+    #[test]
+    fn the_first_executable_nice_on_the_search_path_launches_low_priority_work() {
+        let plain = tempfile::tempdir().unwrap();
+        let executable = tempfile::tempdir().unwrap();
+        std::fs::write(plain.path().join("nice"), "").unwrap();
+        let nice = executable.path().join("nice");
+        std::fs::write(&nice, "").unwrap();
+        std::fs::set_permissions(&nice, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let search_path = std::env::join_paths([plain.path(), executable.path()]).unwrap();
+
+        assert_eq!(
+            low_priority_launcher(Some(&search_path)),
+            Launcher::Niced(nice)
         );
     }
 
