@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use devrun_supervisor::{
-    Command, Event, LaunchSpec, ResourceUsage, ServiceId, ServiceState, ServiceStatus,
+    Command, Event, LaunchSpec, RebuildProgress, ResourceUsage, ServiceId, ServiceState,
+    ServiceStatus,
 };
 use tui_term::vt100;
 
@@ -29,11 +30,16 @@ pub struct Pane {
     pub ports: Vec<u16>,
     terminal: vt100::Parser,
     usage: Option<ResourceUsage>,
+    rebuild: Option<RebuildProgress>,
 }
 
 impl Pane {
     pub fn usage(&self) -> Option<ResourceUsage> {
         self.usage
+    }
+
+    pub fn rebuild(&self) -> Option<&RebuildProgress> {
+        self.rebuild.as_ref()
     }
 
     pub fn screen(&self) -> &vt100::Screen {
@@ -62,6 +68,7 @@ impl Dashboard {
                 ports: spec.ports.clone(),
                 terminal: vt100::Parser::new(size.rows, size.cols, SCROLLBACK_LINES),
                 usage: None,
+                rebuild: None,
             })
             .collect();
         Self {
@@ -117,6 +124,13 @@ impl Dashboard {
                     && let Some(pane) = self.pane_mut(service)
                 {
                     pane.usage = None;
+                    pane.rebuild = None;
+                }
+            }
+            Event::Rebuild { service, progress } => {
+                if let Some(pane) = self.pane_mut(service) {
+                    pane.rebuild =
+                        (*progress != RebuildProgress::Succeeded).then(|| progress.clone());
                 }
             }
             Event::Rejected { .. } | Event::ShutdownComplete => {}
@@ -475,6 +489,47 @@ pub mod tests {
         });
 
         assert_eq!(dashboard.panes()[0].usage(), None);
+    }
+
+    fn rebuild(id: &str, progress: RebuildProgress) -> Event {
+        Event::Rebuild {
+            service: ServiceId::new(id),
+            progress,
+        }
+    }
+
+    #[test]
+    fn rebuild_progress_is_kept_until_it_succeeds() {
+        let mut dashboard = dashboard_for(&["api", "web"]);
+        let running = RebuildProgress::Running { step: 1, total: 2 };
+
+        dashboard.apply(&rebuild("api", running.clone()));
+        assert_eq!(dashboard.panes()[0].rebuild(), Some(&running));
+        assert_eq!(dashboard.panes()[1].rebuild(), None);
+
+        dashboard.apply(&rebuild("api", RebuildProgress::Succeeded));
+        assert_eq!(dashboard.panes()[0].rebuild(), None);
+    }
+
+    #[test]
+    fn a_failed_rebuild_stays_visible_until_the_service_is_no_longer_live() {
+        let mut dashboard = dashboard_for(&["api"]);
+        let failed = RebuildProgress::Failed {
+            reason: "prepare step 1/1 failed with code 2".to_owned(),
+        };
+
+        dashboard.apply(&rebuild("api", failed.clone()));
+        dashboard.apply(&Event::State {
+            service: ServiceId::new("api"),
+            state: ServiceState::Ready { pid: 1 },
+        });
+        assert_eq!(dashboard.panes()[0].rebuild(), Some(&failed));
+        dashboard.apply(&Event::State {
+            service: ServiceId::new("api"),
+            state: ServiceState::Stopping,
+        });
+
+        assert_eq!(dashboard.panes()[0].rebuild(), None);
     }
 
     #[test]

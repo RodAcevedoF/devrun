@@ -1,4 +1,4 @@
-use devrun_supervisor::{ServiceId, ServiceState, ServiceStatus};
+use devrun_supervisor::{RebuildProgress, ServiceId, ServiceState, ServiceStatus};
 
 const KIB: u64 = 1024;
 const MIB: u64 = 1024 * KIB;
@@ -48,6 +48,14 @@ pub fn describe(state: &ServiceState) -> String {
         ServiceState::Exited { code: None } => "terminated by a signal".to_owned(),
         ServiceState::Failed { reason } => format!("failed: {reason}"),
         other => badge(other).to_owned(),
+    }
+}
+
+pub fn describe_rebuild(progress: &RebuildProgress) -> String {
+    match progress {
+        RebuildProgress::Running { step, total } => format!("rebuilding {step}/{total}"),
+        RebuildProgress::Succeeded => "rebuilt".to_owned(),
+        RebuildProgress::Failed { reason } => format!("rebuild failed: {reason}"),
     }
 }
 
@@ -152,6 +160,21 @@ mod tests {
         assert_eq!(memory_size(GIB), "1.0 GB");
         assert_eq!(memory_size(GIB + GIB / 2), "1.5 GB");
         assert_eq!(memory_size(12 * GIB), "12.0 GB");
+    }
+
+    #[test]
+    fn describe_rebuild_names_the_step_the_outcome_and_the_failure_reason() {
+        assert_eq!(
+            describe_rebuild(&RebuildProgress::Running { step: 1, total: 2 }),
+            "rebuilding 1/2"
+        );
+        assert_eq!(describe_rebuild(&RebuildProgress::Succeeded), "rebuilt");
+        assert_eq!(
+            describe_rebuild(&RebuildProgress::Failed {
+                reason: "prepare step 2/2 failed with code 4".to_owned()
+            }),
+            "rebuild failed: prepare step 2/2 failed with code 4"
+        );
     }
 
     #[test]

@@ -6,8 +6,8 @@ use std::path::Path;
 
 use common::{Session, id, options, spec};
 use devrun_supervisor::{
-    Command, Event, LaunchSpec, OutputSource, ResourceUsage, ServiceState, ServiceStatus,
-    Supervisor,
+    Command, Event, LaunchSpec, OutputSource, RebuildProgress, ResourceUsage, ServiceState,
+    ServiceStatus, Supervisor,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -95,6 +95,7 @@ fn commands_round_trip_through_json() {
         Command::Start(id("api")),
         Command::Stop(id("api")),
         Command::Restart(id("api")),
+        Command::Rebuild(id("api")),
         Command::Resize {
             rows: 40,
             cols: 100,
@@ -139,6 +140,20 @@ fn events_round_trip_through_json() {
                 processes: 3,
             },
         },
+        Event::Rebuild {
+            service: id("api"),
+            progress: RebuildProgress::Running { step: 1, total: 2 },
+        },
+        Event::Rebuild {
+            service: id("api"),
+            progress: RebuildProgress::Succeeded,
+        },
+        Event::Rebuild {
+            service: id("api"),
+            progress: RebuildProgress::Failed {
+                reason: "prepare step 1/2 failed with code 2".to_owned(),
+            },
+        },
         Event::Rejected {
             reason: "unknown service `ghost`".to_owned(),
         },
@@ -166,17 +181,19 @@ async fn commands_for_unknown_services_are_rejected_without_stopping_the_supervi
     let mut session = Session::start(|dir| vec![spec("web", dir, "sleep 1000")]);
     session.until_running("web").await;
 
-    session.send(Command::Restart(id("ghost")));
-    let rejected = session
-        .until(|event| matches!(event, Event::Rejected { .. }))
-        .await;
+    for command in [Command::Restart(id("ghost")), Command::Rebuild(id("ghost"))] {
+        session.send(command);
+        let rejected = session
+            .until(|event| matches!(event, Event::Rejected { .. }))
+            .await;
 
-    assert_eq!(
-        rejected,
-        Event::Rejected {
-            reason: "unknown service `ghost`".to_owned()
-        }
-    );
+        assert_eq!(
+            rejected,
+            Event::Rejected {
+                reason: "unknown service `ghost`".to_owned()
+            }
+        );
+    }
     assert!(matches!(
         session.handle.snapshot()[0].state,
         ServiceState::Running { .. }

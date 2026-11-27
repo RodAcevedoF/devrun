@@ -27,6 +27,7 @@ pub enum Command {
     Start(ServiceId),
     Stop(ServiceId),
     Restart(ServiceId),
+    Rebuild(ServiceId),
     Resize { rows: u16, cols: u16 },
     Input { service: ServiceId, bytes: Vec<u8> },
     Shutdown,
@@ -57,10 +58,21 @@ pub enum Event {
         service: ServiceId,
         usage: ResourceUsage,
     },
+    Rebuild {
+        service: ServiceId,
+        progress: RebuildProgress,
+    },
     Rejected {
         reason: String,
     },
     ShutdownComplete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RebuildProgress {
+    Running { step: usize, total: usize },
+    Succeeded,
+    Failed { reason: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

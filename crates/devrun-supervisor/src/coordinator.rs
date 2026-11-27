@@ -2,13 +2,13 @@ use portable_pty::PtySize;
 use tokio::sync::{mpsc, watch};
 
 use crate::health::HealthProbe;
-use crate::process::{ExitCode, ManagedProcess};
+use crate::process::{ExitCode, GroupTerminator, ManagedProcess, Priority};
 use crate::queue::Publisher;
 use crate::spec::LaunchPlan;
 use crate::usage::{self, UsageSampler};
 use crate::{
-    Command, Event, LaunchSpec, OutputSource, ServiceId, ServiceState, ServiceStatus,
-    SupervisorOptions,
+    Command, Event, LaunchSpec, OutputSource, RebuildProgress, ServiceId, ServiceState,
+    ServiceStatus, SupervisorOptions,
 };
 
 #[derive(Clone, Copy)]
@@ -57,12 +57,23 @@ struct Active {
     _health: Option<HealthProbe>,
 }
 
+struct RebuildRun {
+    generation: u64,
+    step: usize,
+    process: ManagedProcess,
+    dirty: bool,
+    terminating: bool,
+    cancelled: bool,
+}
+
 struct Slot {
     spec: LaunchSpec,
     needs: Vec<usize>,
     state: ServiceState,
     prepared: bool,
+    prepare_again: bool,
     active: Option<Active>,
+    rebuild: Option<RebuildRun>,
 }
 
 enum Readiness {
@@ -98,7 +109,9 @@ impl Coordinator {
                 spec,
                 needs,
                 prepared: false,
+                prepare_again: false,
                 active: None,
+                rebuild: None,
             })
             .collect();
         let statuses = slots
@@ -154,6 +167,7 @@ impl Coordinator {
             Command::Start(id) => self.with_service(&id, Self::request_start),
             Command::Stop(id) => self.with_service(&id, |this, service| this.stop(service, false)),
             Command::Restart(id) => self.with_service(&id, Self::restart),
+            Command::Rebuild(id) => self.with_service(&id, Self::rebuild),
             Command::Resize { rows, cols } => self.resize(rows, cols),
             Command::Input { service, bytes } => self.with_service(&service, |this, service| {
                 if let Some(active) = &this.slots[service].active {
@@ -239,6 +253,8 @@ impl Coordinator {
     }
 
     fn stop(&mut self, service: usize, then_start: bool) {
+        self.cancel_rebuild(service);
+        self.slots[service].prepare_again = false;
         if matches!(self.slots[service].state, ServiceState::Waiting { .. }) {
             self.set_state(service, ServiceState::Stopped);
             return;
@@ -350,7 +366,13 @@ impl Coordinator {
         };
         self.next_generation += 1;
         let generation = self.next_generation;
-        match self.spawn_process(service, generation, phase, &command) {
+        match self.spawn_process(
+            service,
+            generation,
+            phase.source(),
+            &command,
+            Priority::Normal,
+        ) {
             Ok(process) => self.track(service, generation, phase, process),
             Err(reason) => {
                 self.set_state(
@@ -367,16 +389,18 @@ impl Coordinator {
         &self,
         service: usize,
         generation: u64,
-        phase: Phase,
+        source: OutputSource,
         command: &str,
+        priority: Priority,
     ) -> Result<ManagedProcess, String> {
         let output = self
             .events
-            .output_sink(self.slots[service].spec.id.clone(), phase.source());
+            .output_sink(self.slots[service].spec.id.clone(), source);
         let exit = self.internal_sender.clone();
         ManagedProcess::spawn(
             &self.slots[service].spec,
             command,
+            priority,
             self.size,
             move |bytes| output.send(bytes),
             move || {
@@ -416,8 +440,17 @@ impl Coordinator {
         let Some(active) = &self.slots[service].active else {
             return;
         };
-        let terminator = active.process.terminator();
-        let generation = active.generation;
+        self.terminate_group(service, active.generation, active.process.terminator());
+    }
+
+    fn terminate_rebuild(&self, service: usize) {
+        let Some(run) = &self.slots[service].rebuild else {
+            return;
+        };
+        self.terminate_group(service, run.generation, run.process.terminator());
+    }
+
+    fn terminate_group(&self, service: usize, generation: u64, terminator: GroupTerminator) {
         let grace_period = self.options.grace_period;
         let gone = self.internal_sender.clone();
         tokio::spawn(async move {
@@ -438,6 +471,10 @@ impl Coordinator {
     }
 
     fn leader_exited(&mut self, service: usize, generation: u64) {
+        if self.is_rebuild(service, generation) {
+            self.rebuild_leader_exited(service);
+            return;
+        }
         let Some(active) = self.active_generation(service, generation) else {
             return;
         };
@@ -457,6 +494,10 @@ impl Coordinator {
     }
 
     fn group_gone(&mut self, service: usize, generation: u64, code: ExitCode) {
+        if self.is_rebuild(service, generation) {
+            self.rebuild_group_gone(service, code);
+            return;
+        }
         let Some(active) = self.slots[service]
             .active
             .take_if(|active| active.generation == generation)
@@ -479,7 +520,10 @@ impl Coordinator {
 
     fn prepare_finished(&mut self, service: usize, step: usize, code: ExitCode) {
         let total = self.slots[service].spec.prepare.len();
-        if code != Some(0) {
+        let finished = code != Some(0) || step + 1 == total;
+        if finished && std::mem::take(&mut self.slots[service].prepare_again) {
+            self.launch(service, Phase::Prepare { step: 0 });
+        } else if code != Some(0) {
             let reason = format!(
                 "prepare step {}/{total} {}",
                 step + 1,
@@ -497,6 +541,9 @@ impl Coordinator {
     async fn shutdown(&mut self) {
         self.shutting_down = true;
         for service in 0..self.slots.len() {
+            self.cancel_rebuild(service);
+        }
+        for service in 0..self.slots.len() {
             if matches!(self.slots[service].state, ServiceState::Waiting { .. }) {
                 self.set_state(service, ServiceState::Stopped);
             }
@@ -504,7 +551,7 @@ impl Coordinator {
         for position in (0..self.start_order.len()).rev() {
             let service = self.start_order[position];
             self.stop(service, false);
-            while self.slots[service].active.is_some() {
+            while self.slots[service].active.is_some() || self.slots[service].rebuild.is_some() {
                 match self.internal.recv().await {
                     Some(message) => self.handle_internal(message),
                     None => break,
@@ -515,6 +562,161 @@ impl Coordinator {
             self.handle_internal(message);
         }
         self.emit(Event::ShutdownComplete);
+    }
+
+    fn rebuild(&mut self, service: usize) {
+        if self.shutting_down {
+            return;
+        }
+        if let Some(run) = &mut self.slots[service].rebuild {
+            run.dirty = true;
+            return;
+        }
+        match self.slots[service].state {
+            ServiceState::Preparing { .. } => self.slots[service].prepare_again = true,
+            ServiceState::Starting | ServiceState::Running { .. } | ServiceState::Ready { .. }
+                if self.is_serving(service) =>
+            {
+                self.start_rebuild(service);
+            }
+            ServiceState::Exited { .. } | ServiceState::Failed { .. } => {
+                self.slots[service].prepared = false;
+                self.request_start(service);
+            }
+            _ => self.slots[service].prepared = false,
+        }
+    }
+
+    fn is_serving(&self, service: usize) -> bool {
+        self.slots[service]
+            .active
+            .as_ref()
+            .is_some_and(|active| active.phase == Phase::Service && active.ending.is_none())
+    }
+
+    fn start_rebuild(&mut self, service: usize) {
+        if self.slots[service].spec.prepare.is_empty() {
+            self.rebuild_ended(service, false, Ok(()));
+        } else {
+            self.launch_rebuild_step(service, 0, false);
+        }
+    }
+
+    fn launch_rebuild_step(&mut self, service: usize, step: usize, dirty: bool) {
+        if self.shutting_down {
+            return;
+        }
+        let total = self.slots[service].spec.prepare.len();
+        self.emit_rebuild(
+            service,
+            RebuildProgress::Running {
+                step: step + 1,
+                total,
+            },
+        );
+        let command = self.slots[service].spec.prepare[step].clone();
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        match self.spawn_process(
+            service,
+            generation,
+            OutputSource::Prepare,
+            &command,
+            Priority::Low,
+        ) {
+            Ok(process) => {
+                self.slots[service].rebuild = Some(RebuildRun {
+                    generation,
+                    step,
+                    process,
+                    dirty,
+                    terminating: false,
+                    cancelled: false,
+                });
+            }
+            Err(reason) => {
+                let reason = launch_failure(Phase::Prepare { step }, total, &reason);
+                self.rebuild_ended(service, dirty, Err(reason));
+            }
+        }
+    }
+
+    fn is_rebuild(&self, service: usize, generation: u64) -> bool {
+        self.slots[service]
+            .rebuild
+            .as_ref()
+            .is_some_and(|run| run.generation == generation)
+    }
+
+    fn rebuild_leader_exited(&mut self, service: usize) {
+        let Some(run) = &mut self.slots[service].rebuild else {
+            return;
+        };
+        if !run.terminating {
+            run.terminating = true;
+            self.terminate_rebuild(service);
+        }
+    }
+
+    fn rebuild_group_gone(&mut self, service: usize, code: ExitCode) {
+        let Some(run) = self.slots[service].rebuild.take() else {
+            return;
+        };
+        if run.cancelled {
+            return;
+        }
+        let total = self.slots[service].spec.prepare.len();
+        if code != Some(0) {
+            let reason = format!(
+                "prepare step {}/{total} {}",
+                run.step + 1,
+                failure_description(code)
+            );
+            self.rebuild_ended(service, run.dirty, Err(reason));
+        } else if run.step + 1 < total {
+            self.launch_rebuild_step(service, run.step + 1, run.dirty);
+        } else {
+            self.rebuild_ended(service, run.dirty, Ok(()));
+        }
+    }
+
+    fn rebuild_ended(&mut self, service: usize, dirty: bool, outcome: Result<(), String>) {
+        if self.shutting_down {
+            return;
+        }
+        if dirty {
+            self.start_rebuild(service);
+            return;
+        }
+        match outcome {
+            Ok(()) => {
+                self.emit_rebuild(service, RebuildProgress::Succeeded);
+                self.restart(service);
+            }
+            Err(reason) => self.emit_rebuild(service, RebuildProgress::Failed { reason }),
+        }
+    }
+
+    fn cancel_rebuild(&mut self, service: usize) {
+        let Some(run) = &mut self.slots[service].rebuild else {
+            return;
+        };
+        if run.cancelled {
+            return;
+        }
+        run.cancelled = true;
+        let already_terminating = std::mem::replace(&mut run.terminating, true);
+        self.slots[service].prepared = false;
+        if !already_terminating {
+            self.terminate_rebuild(service);
+        }
+    }
+
+    fn emit_rebuild(&self, service: usize, progress: RebuildProgress) {
+        self.emit(Event::Rebuild {
+            service: self.slots[service].spec.id.clone(),
+            progress,
+        });
     }
 
     fn set_state(&mut self, service: usize, state: ServiceState) -> bool {

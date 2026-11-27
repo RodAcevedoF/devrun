@@ -153,6 +153,9 @@ impl Printer {
                 }
                 self.write_note(service, &status::describe(state))
             }
+            Event::Rebuild { service, progress } => {
+                self.write_note(service, &status::describe_rebuild(progress))
+            }
             Event::Usage { .. } | Event::Rejected { .. } | Event::ShutdownComplete => Ok(()),
         }
     }

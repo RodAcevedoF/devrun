@@ -16,8 +16,15 @@ use crate::LaunchSpec;
 const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const KILL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_BUFFER_SIZE: usize = 8192;
+const LOW_PRIORITY_NICENESS: &str = "10";
 
 pub(crate) type ExitCode = Option<i32>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Priority {
+    Normal,
+    Low,
+}
 
 #[derive(Default)]
 struct Lifecycle {
@@ -46,6 +53,7 @@ impl ManagedProcess {
     pub fn spawn(
         spec: &LaunchSpec,
         command: &str,
+        priority: Priority,
         size: PtySize,
         on_output: impl Fn(Vec<u8>) + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
@@ -55,7 +63,7 @@ impl ManagedProcess {
             .map_err(|error| error.to_string())?;
         let mut child = pair
             .slave
-            .spawn_command(shell_command(spec, command)?)
+            .spawn_command(shell_command(spec, command, priority)?)
             .map_err(|error| error.to_string())?;
         drop(pair.slave);
         let attached = attach(child.as_ref(), pair.master.as_ref());
@@ -158,14 +166,25 @@ fn group_alive(group: Pid) -> bool {
     killpg(group, None) != Err(Errno::ESRCH)
 }
 
-fn shell_command(spec: &LaunchSpec, command: &str) -> Result<CommandBuilder, String> {
+fn shell_command(
+    spec: &LaunchSpec,
+    command: &str,
+    priority: Priority,
+) -> Result<CommandBuilder, String> {
     if !spec.cwd.is_dir() {
         return Err(format!(
             "working directory {} does not exist",
             spec.cwd.display()
         ));
     }
-    let mut builder = CommandBuilder::new("/bin/sh");
+    let mut builder = match priority {
+        Priority::Normal => CommandBuilder::new("/bin/sh"),
+        Priority::Low => {
+            let mut niced = CommandBuilder::new("nice");
+            niced.args(["-n", LOW_PRIORITY_NICENESS, "/bin/sh"]);
+            niced
+        }
+    };
     builder.arg("-c");
     builder.arg(command);
     builder.cwd(&spec.cwd);

@@ -1,4 +1,4 @@
-use devrun_supervisor::{ResourceUsage, ServiceState, ServiceStatus};
+use devrun_supervisor::{RebuildProgress, ResourceUsage, ServiceState, ServiceStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -84,6 +84,13 @@ fn tone_style(tone: Tone) -> Style {
         Tone::Ready => style.fg(Color::Green),
         Tone::Failed => style.fg(Color::Red),
         Tone::Ended => style.add_modifier(Modifier::DIM),
+    }
+}
+
+fn rebuild_style(progress: &RebuildProgress) -> Style {
+    match progress {
+        RebuildProgress::Failed { .. } => tone_style(Tone::Failed),
+        RebuildProgress::Running { .. } | RebuildProgress::Succeeded => tone_style(Tone::Preparing),
     }
 }
 
@@ -220,6 +227,12 @@ fn pane_title<'a>(pane: &'a Pane, state: &ServiceState) -> Line<'a> {
             detail_style.add_modifier(Modifier::BOLD),
         ),
     ];
+    if let Some(progress) = pane.rebuild() {
+        spans.push(Span::styled(
+            format!(" · {}", status::describe_rebuild(progress)),
+            rebuild_style(progress),
+        ));
+    }
     if !pane.ports.is_empty() {
         spans.push(Span::styled(
             format!(" · {}", ports_label(&pane.ports)),
@@ -417,6 +430,42 @@ mod tests {
         let buffer = render(&dashboard, &states);
 
         find(&buffer, "api · running · 12.5% · 150 MB ");
+    }
+
+    #[test]
+    fn pane_title_shows_rebuild_progress_after_the_state() {
+        let mut dashboard = fixed_dashboard();
+        let states = fixed_states();
+        select(&mut dashboard, &states, "api");
+        dashboard.apply(&Event::Rebuild {
+            service: ServiceId::new("api"),
+            progress: devrun_supervisor::RebuildProgress::Running { step: 1, total: 2 },
+        });
+
+        let buffer = render(&dashboard, &states);
+
+        find(&buffer, "api · running · rebuilding 1/2 ");
+    }
+
+    #[test]
+    fn pane_title_shows_a_failed_rebuild_in_the_failure_color() {
+        let mut dashboard = fixed_dashboard();
+        let states = fixed_states();
+        select(&mut dashboard, &states, "api");
+        dashboard.apply(&Event::Rebuild {
+            service: ServiceId::new("api"),
+            progress: devrun_supervisor::RebuildProgress::Failed {
+                reason: "prepare step 1/1 failed with code 2".to_owned(),
+            },
+        });
+
+        let buffer = render(&dashboard, &states);
+
+        let (x, y) = find(
+            &buffer,
+            "rebuild failed: prepare step 1/1 failed with code 2",
+        );
+        assert_eq!(buffer[(x, y)].fg, Color::Red);
     }
 
     #[test]
