@@ -7,6 +7,9 @@ use devrun_supervisor::{Command, Event, LaunchSpec, RebuildProgress, ServiceStat
 
 const COUNTED_BUILD: &str = "echo build >> builds.log; ps -o nice= -p $$ | tr -d ' ' > nice.txt";
 const SLOW_WHEN_FLAGGED: &str = "echo build >> builds.log; if [ -f slow ]; then sleep 0.5; fi";
+const HELD_WHEN_FLAGGED: &str = "echo build >> builds.log; if [ -f hold ]; then while [ ! -f release ]; do sleep 0.02; done; fi";
+const CRASHES_ON_REQUEST: &str = "while [ ! -f crash ]; do sleep 0.02; done; rm crash; exit 3";
+const CRASHES_LEAVING_A_STUBBORN_CHILD: &str = "(trap '' TERM HUP; while kill -0 $$ 2>/dev/null; do sleep 0.02; done; touch leader-gone; while :; do sleep 0.02; done) & while [ ! -f crash ]; do sleep 0.02; done; rm crash; exit 3";
 
 fn prepared(raw_id: &str, dir: &std::path::Path, prepare: &[&str]) -> LaunchSpec {
     LaunchSpec {
@@ -308,6 +311,108 @@ async fn shutdown_during_a_rebuild_terminates_the_rebuild() {
     session.shutdown().await;
 
     wait_until_gone(&rebuild).await;
+}
+
+#[tokio::test]
+async fn rebuild_while_the_service_is_ending_re_prepares_it_on_its_next_start_without_restarting_it()
+ {
+    let options = devrun_supervisor::SupervisorOptions {
+        grace_period: std::time::Duration::from_secs(1),
+        ..common::options()
+    };
+    let mut session = Session::start_with(options, |dir| {
+        vec![LaunchSpec {
+            prepare: vec![COUNTED_BUILD.to_owned()],
+            ..spec("api", dir, CRASHES_LEAVING_A_STUBBORN_CHILD)
+        }]
+    });
+    session.until_running("api").await;
+    std::fs::write(session.path("crash"), "").unwrap();
+    wait_for_file(&session, "leader-gone").await;
+
+    session.send(Command::Rebuild(id("api")));
+    session
+        .until_state("api", |state| {
+            *state == ServiceState::Exited { code: Some(3) }
+        })
+        .await;
+    session.fence().await;
+
+    assert!(rebuild_progress(&session, "api").is_empty());
+    assert_eq!(
+        session.handle.snapshot()[0].state,
+        ServiceState::Exited { code: Some(3) }
+    );
+    assert_eq!(line_count(&session, "builds.log"), 1);
+
+    session.send(Command::Start(id("api")));
+    session.until_running("api").await;
+    let exited = session.position("api", |state| matches!(state, ServiceState::Exited { .. }));
+    let preparing = session.position_after("api", exited, |state| {
+        matches!(state, ServiceState::Preparing { .. })
+    });
+    assert!(preparing.is_some(), "the next start did not re-prepare");
+    assert_eq!(line_count(&session, "builds.log"), 2);
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_service_that_crashes_mid_rebuild_starts_again_without_a_second_prepare_when_the_rebuild_succeeds()
+ {
+    let mut session = Session::start(|dir| {
+        vec![LaunchSpec {
+            prepare: vec![HELD_WHEN_FLAGGED.to_owned()],
+            ..spec("api", dir, CRASHES_ON_REQUEST)
+        }]
+    });
+    let first = session.until_running("api").await;
+    std::fs::write(session.path("hold"), "").unwrap();
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(&mut session, "api", is_running).await;
+
+    std::fs::write(session.path("crash"), "").unwrap();
+    session
+        .until_state("api", |state| {
+            *state == ServiceState::Exited { code: Some(3) }
+        })
+        .await;
+    std::fs::write(session.path("release"), "").unwrap();
+    until_rebuild(&mut session, "api", is_succeeded).await;
+    let second = session.until_running("api").await;
+    session.fence().await;
+
+    assert_ne!(first, second);
+    assert_eq!(line_count(&session, "builds.log"), 2);
+    assert_eq!(
+        rebuild_progress(&session, "api"),
+        [
+            RebuildProgress::Running { step: 1, total: 1 },
+            RebuildProgress::Succeeded
+        ]
+    );
+    let exited = session.position("api", |state| matches!(state, ServiceState::Exited { .. }));
+    assert_eq!(
+        session.position_after("api", exited, |state| {
+            matches!(state, ServiceState::Preparing { .. })
+        }),
+        None
+    );
+    assert_eq!(
+        session.handle.snapshot()[0].state,
+        ServiceState::Running { pid: second }
+    );
+    session.shutdown().await;
+}
+
+async fn wait_for_file(session: &Session, name: &str) {
+    let path = session.path(name);
+    tokio::time::timeout(common::EVENT_TIMEOUT, async {
+        while !path.exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{name} was never written"));
 }
 
 async fn wait_for_pid(session: &Session, name: &str) -> Vec<u32> {

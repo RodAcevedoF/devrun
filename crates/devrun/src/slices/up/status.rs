@@ -53,10 +53,18 @@ pub fn describe(state: &ServiceState) -> String {
 
 pub fn describe_rebuild(progress: &RebuildProgress) -> String {
     match progress {
-        RebuildProgress::Running { step, total } => format!("rebuilding {step}/{total}"),
+        RebuildProgress::Running { step, total } => rebuilding(*step, *total),
         RebuildProgress::Succeeded => "rebuilt".to_owned(),
-        RebuildProgress::Failed { reason } => format!("rebuild failed: {reason}"),
+        RebuildProgress::Failed { reason } => rebuild_failed(reason),
     }
+}
+
+pub fn rebuilding(step: usize, total: usize) -> String {
+    format!("rebuilding {step}/{total}")
+}
+
+pub fn rebuild_failed(reason: &str) -> String {
+    format!("rebuild failed: {reason}")
 }
 
 pub fn is_active(state: &ServiceState) -> bool {

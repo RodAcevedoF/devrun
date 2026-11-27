@@ -1,4 +1,4 @@
-use devrun_supervisor::{RebuildProgress, ResourceUsage, ServiceState, ServiceStatus};
+use devrun_supervisor::{ResourceUsage, ServiceState, ServiceStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 use tui_term::widget::{Cursor, PseudoTerminal};
 
 use super::super::status::{self, Tone};
-use super::model::{Dashboard, Mode, Pane, PaneSize};
+use super::model::{Dashboard, Mode, Pane, PaneSize, RebuildNotice};
 
 pub const SIDEBAR_WIDTH: u16 = 30;
 const BORDER: u16 = 2;
@@ -87,11 +87,14 @@ fn tone_style(tone: Tone) -> Style {
     }
 }
 
-fn rebuild_style(progress: &RebuildProgress) -> Style {
-    match progress {
-        RebuildProgress::Failed { .. } => tone_style(Tone::Failed),
-        RebuildProgress::Running { .. } | RebuildProgress::Succeeded => tone_style(Tone::Preparing),
-    }
+fn rebuild_span(notice: &RebuildNotice) -> Span<'static> {
+    let (text, tone) = match notice {
+        RebuildNotice::Running { step, total } => {
+            (status::rebuilding(*step, *total), Tone::Preparing)
+        }
+        RebuildNotice::Failed { reason } => (status::rebuild_failed(reason), Tone::Failed),
+    };
+    Span::styled(format!(" · {text}"), tone_style(tone))
 }
 
 fn dim() -> Style {
@@ -227,11 +230,8 @@ fn pane_title<'a>(pane: &'a Pane, state: &ServiceState) -> Line<'a> {
             detail_style.add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some(progress) = pane.rebuild() {
-        spans.push(Span::styled(
-            format!(" · {}", status::describe_rebuild(progress)),
-            rebuild_style(progress),
-        ));
+    if let Some(notice) = pane.rebuild() {
+        spans.push(rebuild_span(notice));
     }
     if !pane.ports.is_empty() {
         spans.push(Span::styled(

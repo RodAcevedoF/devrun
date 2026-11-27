@@ -207,6 +207,23 @@ impl Session {
             .unwrap_or_else(|| panic!("state not found; history: {:#?}", self.history))
     }
 
+    pub fn position_after(
+        &self,
+        raw_id: &str,
+        after: usize,
+        matches: impl Fn(&ServiceState) -> bool,
+    ) -> Option<usize> {
+        let wanted = id(raw_id);
+        self.history
+            .iter()
+            .enumerate()
+            .skip(after + 1)
+            .find_map(|(position, event)| {
+                matches!(event, Event::State { service, state } if *service == wanted && matches(state))
+                    .then_some(position)
+            })
+    }
+
     pub async fn shutdown(&mut self) {
         self.send(Command::Shutdown);
         self.until(|event| matches!(event, Event::ShutdownComplete))
