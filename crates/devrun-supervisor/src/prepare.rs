@@ -1,4 +1,4 @@
-use crate::process::ExitCode;
+use crate::process::{ExitCode, ExitWording, describe_exit};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PrepareOutcome {
@@ -39,7 +39,7 @@ pub(crate) fn step_outcome(step: usize, total: usize, code: ExitCode) -> StepOut
         StepOutcome::Ended(PrepareOutcome::Failed(format!(
             "{} {}",
             step_label(step, total),
-            failure_description(code)
+            describe_exit(code, ExitWording::Failed)
         )))
     } else if step + 1 < total {
         StepOutcome::Next { step: step + 1 }
@@ -52,15 +52,12 @@ pub(crate) fn could_not_start(step: usize, total: usize, reason: &str) -> String
     format!("{} could not start: {reason}", step_label(step, total))
 }
 
-fn step_label(step: usize, total: usize) -> String {
-    format!("prepare step {}/{total}", step + 1)
+pub(crate) fn step_number(step: usize) -> usize {
+    step + 1
 }
 
-fn failure_description(code: ExitCode) -> String {
-    match code {
-        Some(code) => format!("failed with code {code}"),
-        None => "was terminated by a signal".to_owned(),
-    }
+fn step_label(step: usize, total: usize) -> String {
+    format!("prepare step {}/{total}", step_number(step))
 }
 
 #[cfg(test)]

@@ -38,17 +38,9 @@ pub(crate) fn on_request(state: &ServiceState, process: ServiceProcess) -> Rebui
 enum Stage {
     Running,
     Reaping,
-    Cancelled,
-}
-
-pub(crate) enum Cancellation {
-    Terminate(GroupTerminator),
-    AlreadyReaping,
-    AlreadyCancelled,
 }
 
 pub(crate) enum StepEnd {
-    Cancelled,
     NextStep { step: usize, rerun: RerunRequest },
     Ended(PrepareEnd),
 }
@@ -59,6 +51,17 @@ pub(crate) struct RebuildRun {
     process: ManagedProcess,
     rerun: RerunRequest,
     stage: Stage,
+}
+
+pub(crate) struct WindingDown {
+    generation: u64,
+    _process: ManagedProcess,
+}
+
+impl WindingDown {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
 }
 
 impl RebuildRun {
@@ -81,27 +84,25 @@ impl RebuildRun {
     }
 
     pub fn leader_exited(&mut self) -> Option<GroupTerminator> {
-        match self.stage {
-            Stage::Running => {
-                self.stage = Stage::Reaping;
-                Some(self.process.terminator())
-            }
-            Stage::Reaping | Stage::Cancelled => None,
+        match std::mem::replace(&mut self.stage, Stage::Reaping) {
+            Stage::Running => Some(self.process.terminator()),
+            Stage::Reaping => None,
         }
     }
 
-    pub fn cancel(&mut self) -> Cancellation {
-        match std::mem::replace(&mut self.stage, Stage::Cancelled) {
-            Stage::Running => Cancellation::Terminate(self.process.terminator()),
-            Stage::Reaping => Cancellation::AlreadyReaping,
-            Stage::Cancelled => Cancellation::AlreadyCancelled,
-        }
+    pub fn cancel(self) -> (WindingDown, Option<GroupTerminator>) {
+        let terminator = match self.stage {
+            Stage::Running => Some(self.process.terminator()),
+            Stage::Reaping => None,
+        };
+        let winding_down = WindingDown {
+            generation: self.generation,
+            _process: self.process,
+        };
+        (winding_down, terminator)
     }
 
     pub fn group_gone(self, total: usize, code: ExitCode) -> StepEnd {
-        if self.stage == Stage::Cancelled {
-            return StepEnd::Cancelled;
-        }
         match prepare::step_outcome(self.step, total, code) {
             StepOutcome::Next { step } => StepEnd::NextStep {
                 step,

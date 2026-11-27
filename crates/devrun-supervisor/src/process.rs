@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::fmt::Display;
 use std::io::{ErrorKind, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, mpsc};
@@ -17,6 +18,8 @@ const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const KILL_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_BUFFER_SIZE: usize = 8192;
 const LOW_PRIORITY_NICENESS: &str = "10";
+const NICE: &str = "/usr/bin/nice";
+const SHELL: &str = "/bin/sh";
 
 pub(crate) type ExitCode = Option<i32>;
 
@@ -24,6 +27,23 @@ pub(crate) type ExitCode = Option<i32>;
 pub(crate) enum Priority {
     Normal,
     Low,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitWording {
+    Exited,
+    Failed,
+}
+
+pub(crate) fn describe_exit(code: ExitCode, wording: ExitWording) -> String {
+    let verb = match wording {
+        ExitWording::Exited => "exited",
+        ExitWording::Failed => "failed",
+    };
+    match code {
+        Some(code) => format!("{verb} with code {code}"),
+        None => "was terminated by a signal".to_owned(),
+    }
 }
 
 #[derive(Default)]
@@ -58,13 +78,11 @@ impl ManagedProcess {
         on_output: impl Fn(Vec<u8>) + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
     ) -> Result<Self, String> {
-        let pair = native_pty_system()
-            .openpty(size)
-            .map_err(|error| error.to_string())?;
+        let pair = native_pty_system().openpty(size).map_err(single_line)?;
         let mut child = pair
             .slave
             .spawn_command(shell_command(spec, command, priority)?)
-            .map_err(|error| error.to_string())?;
+            .map_err(single_line)?;
         drop(pair.slave);
         let attached = attach(child.as_ref(), pair.master.as_ref());
         let (pid, group, reader, writer) = match attached {
@@ -154,11 +172,9 @@ fn attach(
     let pid = child
         .process_id()
         .ok_or_else(|| "process id is unavailable".to_owned())?;
-    let group = Pid::from_raw(i32::try_from(pid).map_err(|error| error.to_string())?);
-    let reader = master
-        .try_clone_reader()
-        .map_err(|error| error.to_string())?;
-    let writer = master.take_writer().map_err(|error| error.to_string())?;
+    let group = Pid::from_raw(i32::try_from(pid).map_err(single_line)?);
+    let reader = master.try_clone_reader().map_err(single_line)?;
+    let writer = master.take_writer().map_err(single_line)?;
     Ok((pid, group, reader, writer))
 }
 
@@ -178,10 +194,10 @@ fn shell_command(
         ));
     }
     let mut builder = match priority {
-        Priority::Normal => CommandBuilder::new("/bin/sh"),
+        Priority::Normal => CommandBuilder::new(SHELL),
         Priority::Low => {
-            let mut niced = CommandBuilder::new("nice");
-            niced.args(["-n", LOW_PRIORITY_NICENESS, "/bin/sh"]);
+            let mut niced = CommandBuilder::new(NICE);
+            niced.args(["-n", LOW_PRIORITY_NICENESS, SHELL]);
             niced
         }
     };
@@ -193,6 +209,16 @@ fn shell_command(
     }
     builder.env("PATH", search_path(spec)?);
     Ok(builder)
+}
+
+fn single_line(error: impl Display) -> String {
+    error
+        .to_string()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn search_path(spec: &LaunchSpec) -> Result<OsString, String> {
@@ -207,7 +233,7 @@ fn search_path(spec: &LaunchSpec) -> Result<OsString, String> {
         .iter()
         .cloned()
         .chain(std::env::split_paths(&inherited));
-    std::env::join_paths(entries).map_err(|error| error.to_string())
+    std::env::join_paths(entries).map_err(single_line)
 }
 
 fn forward_output(
@@ -261,5 +287,33 @@ fn exit_code(status: &ExitStatus) -> ExitCode {
     match status.signal() {
         Some(_) => None,
         None => i32::try_from(status.exit_code()).ok(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_multi_line_failure_reason_folds_into_one_line() {
+        assert_eq!(
+            single_line("Unable to spawn nice because:\n  No viable candidates found.\n\nnone\n"),
+            "Unable to spawn nice because: No viable candidates found. none"
+        );
+    }
+
+    #[test]
+    fn an_exit_reads_as_its_code_or_as_a_signal() {
+        assert_eq!(
+            describe_exit(Some(3), ExitWording::Exited),
+            "exited with code 3"
+        );
+        assert_eq!(
+            describe_exit(Some(4), ExitWording::Failed),
+            "failed with code 4"
+        );
+        for wording in [ExitWording::Exited, ExitWording::Failed] {
+            assert_eq!(describe_exit(None, wording), "was terminated by a signal");
+        }
     }
 }

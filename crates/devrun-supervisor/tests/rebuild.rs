@@ -9,6 +9,10 @@ const COUNTED_BUILD: &str = "echo build >> builds.log; ps -o nice= -p $$ | tr -d
 const SLOW_WHEN_FLAGGED: &str = "echo build >> builds.log; if [ -f slow ]; then sleep 0.5; fi";
 const HELD_WHEN_FLAGGED: &str = "echo build >> builds.log; if [ -f hold ]; then while [ ! -f release ]; do sleep 0.02; done; fi";
 const CRASHES_ON_REQUEST: &str = "while [ ! -f crash ]; do sleep 0.02; done; rm crash; exit 3";
+const HANGS_ONCE_WHEN_FLAGGED: &str =
+    "if [ -f hang ]; then rm hang; echo $$ > rebuild.pid; sleep 1000; fi";
+const WINDS_DOWN_SLOWLY_ONCE_WHEN_FLAGGED: &str = "if [ -f trap ]; then rm trap; trap 'while [ ! -f release ]; do sleep 0.02; done; exit 1' TERM; echo $$ > rebuild.pid; while :; do sleep 0.02; done; fi; echo build >> builds.log";
+const FAILS_WHEN_BROKEN: &str = "echo build >> builds.log; if [ -f broken ]; then exit 4; fi";
 const CRASHES_LEAVING_A_STUBBORN_CHILD: &str = "(trap '' TERM HUP; while kill -0 $$ 2>/dev/null; do sleep 0.02; done; touch leader-gone; while :; do sleep 0.02; done) & while [ ! -f crash ]; do sleep 0.02; done; rm crash; exit 3";
 
 fn prepared(raw_id: &str, dir: &std::path::Path, prepare: &[&str]) -> LaunchSpec {
@@ -402,6 +406,190 @@ async fn a_service_that_crashes_mid_rebuild_starts_again_without_a_second_prepar
         session.handle.snapshot()[0].state,
         ServiceState::Running { pid: second }
     );
+    session.shutdown().await;
+}
+
+async fn user_command_on_a_service_that_crashed_mid_rebuild_cancels_the_rebuild(
+    command: fn(devrun_supervisor::ServiceId) -> Command,
+) {
+    let mut session = Session::start(|dir| {
+        vec![LaunchSpec {
+            prepare: vec![HANGS_ONCE_WHEN_FLAGGED.to_owned()],
+            ..spec("api", dir, CRASHES_ON_REQUEST)
+        }]
+    });
+    let first = session.until_running("api").await;
+    std::fs::write(session.path("hang"), "").unwrap();
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(&mut session, "api", is_running).await;
+    let rebuild = wait_for_pid(&session, "rebuild.pid").await;
+    std::fs::write(session.path("crash"), "").unwrap();
+    session
+        .until_state("api", |state| {
+            *state == ServiceState::Exited { code: Some(3) }
+        })
+        .await;
+
+    session.send(command(id("api")));
+    let second = session.until_running("api").await;
+    wait_until_gone(&rebuild).await;
+    session.fence().await;
+
+    assert_ne!(first, second);
+    assert_eq!(
+        rebuild_progress(&session, "api"),
+        [RebuildProgress::Running { step: 1, total: 1 }]
+    );
+    let starts = session
+        .states_of("api")
+        .iter()
+        .filter(|state| matches!(state, ServiceState::Running { .. }))
+        .count();
+    assert_eq!(starts, 2);
+    assert!(!session.states_of("api").contains(&ServiceState::Stopping));
+    assert_eq!(
+        session.handle.snapshot()[0].state,
+        ServiceState::Running { pid: second }
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn restarting_a_service_that_crashed_mid_rebuild_cancels_the_rebuild_and_starts_it_once() {
+    user_command_on_a_service_that_crashed_mid_rebuild_cancels_the_rebuild(Command::Restart).await;
+}
+
+#[tokio::test]
+async fn starting_a_service_that_crashed_mid_rebuild_cancels_the_rebuild_and_starts_it_once() {
+    user_command_on_a_service_that_crashed_mid_rebuild_cancels_the_rebuild(Command::Start).await;
+}
+
+#[tokio::test]
+async fn starting_a_running_service_cancels_its_rebuild_and_keeps_it_running() {
+    let mut session = Session::start(|dir| vec![prepared("api", dir, &[HANGS_ONCE_WHEN_FLAGGED])]);
+    let pid = session.until_running("api").await;
+    std::fs::write(session.path("hang"), "").unwrap();
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(&mut session, "api", is_running).await;
+    let rebuild = wait_for_pid(&session, "rebuild.pid").await;
+
+    session.send(Command::Start(id("api")));
+    wait_until_gone(&rebuild).await;
+    session.fence().await;
+
+    assert_eq!(
+        rebuild_progress(&session, "api"),
+        [RebuildProgress::Running { step: 1, total: 1 }]
+    );
+    assert_eq!(
+        session.handle.snapshot()[0].state,
+        ServiceState::Running { pid }
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rebuild_requested_while_a_cancelled_rebuild_winds_down_runs_and_restarts_the_service() {
+    let options = devrun_supervisor::SupervisorOptions {
+        grace_period: std::time::Duration::from_secs(5),
+        ..common::options()
+    };
+    let mut session = Session::start_with(options, |dir| {
+        vec![prepared("api", dir, &[WINDS_DOWN_SLOWLY_ONCE_WHEN_FLAGGED])]
+    });
+    session.until_running("api").await;
+    std::fs::write(session.path("trap"), "").unwrap();
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(&mut session, "api", is_running).await;
+    let cancelled = wait_for_pid(&session, "rebuild.pid").await;
+
+    session.send(Command::Restart(id("api")));
+    let restarted = session.until_running("api").await;
+    assert!(common::process_exists(cancelled[0]));
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(&mut session, "api", is_running).await;
+    std::fs::write(session.path("release"), "").unwrap();
+    until_rebuild(&mut session, "api", is_succeeded).await;
+    let rebuilt = session.until_running("api").await;
+    wait_until_gone(&cancelled).await;
+    session.fence().await;
+
+    assert_ne!(restarted, rebuilt);
+    assert_eq!(line_count(&session, "builds.log"), 3);
+    assert_eq!(
+        rebuild_progress(&session, "api"),
+        [
+            RebuildProgress::Running { step: 1, total: 1 },
+            RebuildProgress::Running { step: 1, total: 1 },
+            RebuildProgress::Succeeded
+        ]
+    );
+    assert_eq!(
+        session.handle.snapshot()[0].state,
+        ServiceState::Running { pid: rebuilt }
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_failed_rebuild_makes_the_next_restart_prepare_again_instead_of_starting_the_broken_build()
+ {
+    let mut session = Session::start(|dir| vec![prepared("api", dir, &[FAILS_WHEN_BROKEN])]);
+    session.until_running("api").await;
+    std::fs::write(session.path("broken"), "").unwrap();
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(&mut session, "api", is_failed).await;
+
+    session.send(Command::Restart(id("api")));
+    let failed = session
+        .until_state("api", |state| matches!(state, ServiceState::Failed { .. }))
+        .await;
+    session.fence().await;
+
+    assert_eq!(
+        failed,
+        ServiceState::Failed {
+            reason: "prepare step 1/1 failed with code 4".to_owned()
+        }
+    );
+    assert_eq!(line_count(&session, "builds.log"), 3);
+    let stopped = session.position("api", |state| *state == ServiceState::Stopped);
+    assert_eq!(
+        session.position_after("api", stopped, |state| {
+            matches!(state, ServiceState::Running { .. })
+        }),
+        None
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn rebuild_runs_niced_even_when_the_service_path_has_no_nice() {
+    let mut session = Session::start(|dir| {
+        let mut service = LaunchSpec {
+            prepare: vec!["echo build >> builds.log".to_owned()],
+            ..spec("api", dir, "exec /bin/sleep 1000")
+        };
+        service
+            .env
+            .insert("PATH".to_owned(), dir.display().to_string());
+        vec![service]
+    });
+    let first = session.until_running("api").await;
+
+    session.send(Command::Rebuild(id("api")));
+    until_rebuild(&mut session, "api", |progress| !is_running(progress)).await;
+    assert_eq!(
+        rebuild_progress(&session, "api"),
+        [
+            RebuildProgress::Running { step: 1, total: 1 },
+            RebuildProgress::Succeeded
+        ]
+    );
+    let second = session.until_running("api").await;
+
+    assert_ne!(first, second);
+    assert_eq!(line_count(&session, "builds.log"), 2);
     session.shutdown().await;
 }
 
