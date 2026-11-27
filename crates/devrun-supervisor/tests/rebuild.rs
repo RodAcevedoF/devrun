@@ -576,6 +576,24 @@ async fn stopping_a_service_whose_prepare_waits_for_a_wind_down_never_runs_that_
 }
 
 #[tokio::test]
+async fn restarting_a_service_whose_prepare_waits_for_a_wind_down_still_prepares_and_starts_it() {
+    let mut session = slow_wind_down_session();
+    let cancelled = cancel_a_rebuild_that_winds_down_slowly(&mut session).await;
+
+    session.send(Command::Restart(id("api")));
+    session.until_running("api").await;
+    session.fence().await;
+
+    assert!(!session.path("overlaps.log").exists());
+    assert!(cancelled.iter().all(|pid| !common::process_exists(*pid)));
+    assert!(matches!(
+        session.handle.snapshot()[0].state,
+        ServiceState::Running { .. }
+    ));
+    session.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_failed_rebuild_makes_the_next_restart_prepare_again_instead_of_starting_the_broken_build()
  {
     let mut session = Session::start(|dir| vec![prepared("api", dir, &[FAILS_WHEN_BROKEN])]);
