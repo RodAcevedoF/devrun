@@ -143,11 +143,12 @@ impl Coordinator {
         let mut clock = self.sampler.as_ref().map(UsageSampler::clock);
         loop {
             tokio::select! {
+                biased;
+                Some(message) = self.internal.recv() => self.handle_internal(message),
                 command = commands.recv() => match command {
                     Some(Command::Shutdown) | None => break,
                     Some(command) => self.handle_command(command),
                 },
-                Some(message) = self.internal.recv() => self.handle_internal(message),
                 () = usage::tick(clock.as_mut()) => self.publish_usage(),
             }
             self.reconcile();

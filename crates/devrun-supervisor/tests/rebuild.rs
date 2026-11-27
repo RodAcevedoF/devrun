@@ -329,6 +329,7 @@ async fn rebuild_while_the_service_is_ending_re_prepares_it_on_its_next_start_wi
     session.until_running("api").await;
     std::fs::write(session.path("crash"), "").unwrap();
     wait_for_file(&session, "leader-gone").await;
+    session.fence().await;
 
     session.send(Command::Rebuild(id("api")));
     session
