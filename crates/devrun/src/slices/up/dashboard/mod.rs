@@ -14,6 +14,7 @@ use ratatui::layout::Rect;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
+use super::watch::Watch;
 use model::Dashboard;
 use terminal::TerminalSession;
 
@@ -25,6 +26,7 @@ const EVENT_BATCH: usize = 512;
 pub async fn run(
     repo: String,
     specs: Vec<LaunchSpec>,
+    watch: Option<Watch>,
     mut interrupts: mpsc::UnboundedReceiver<()>,
 ) -> anyhow::Result<()> {
     let mut session = TerminalSession::enter()?;
@@ -35,6 +37,7 @@ pub async fn run(
         ..SupervisorOptions::default()
     };
     let mut handle = Supervisor::spawn(specs.clone(), options)?;
+    let _rebuilds = watch.map(|watch| watch.rebuild_through(handle.commands()));
     let mut dashboard = Dashboard::new(repo, &specs, size);
     let outcome = drive(&mut session, &mut handle, &mut dashboard, &mut interrupts).await;
     drop(session);

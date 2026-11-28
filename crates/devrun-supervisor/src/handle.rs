@@ -21,24 +21,35 @@ impl Supervisor {
         let snapshot = coordinator.subscribe();
         runtime.spawn(coordinator.run(commands));
         Ok(SupervisorHandle {
-            commands: command_sender,
+            commands: CommandSender(command_sender),
             events,
             snapshot,
         })
     }
 }
 
+#[derive(Clone)]
+pub struct CommandSender(mpsc::UnboundedSender<Command>);
+
+impl CommandSender {
+    pub fn send(&self, command: Command) -> Result<(), SupervisorError> {
+        self.0.send(command).map_err(|_| SupervisorError::Closed)
+    }
+}
+
 pub struct SupervisorHandle {
-    commands: mpsc::UnboundedSender<Command>,
+    commands: CommandSender,
     events: EventQueue,
     snapshot: watch::Receiver<Vec<ServiceStatus>>,
 }
 
 impl SupervisorHandle {
     pub fn send(&self, command: Command) -> Result<(), SupervisorError> {
-        self.commands
-            .send(command)
-            .map_err(|_| SupervisorError::Closed)
+        self.commands.send(command)
+    }
+
+    pub fn commands(&self) -> CommandSender {
+        self.commands.clone()
     }
 
     pub async fn recv(&mut self) -> Option<Event> {

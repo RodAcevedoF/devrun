@@ -11,6 +11,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use super::lines::LineAssembler;
 use super::status;
+use super::watch::Watch;
 use crate::ui;
 
 const ROWS: u16 = 48;
@@ -32,6 +33,7 @@ enum Ending {
 
 pub async fn run(
     specs: Vec<LaunchSpec>,
+    watch: Option<Watch>,
     mut interrupts: UnboundedReceiver<()>,
 ) -> anyhow::Result<()> {
     let options = SupervisorOptions {
@@ -42,6 +44,7 @@ pub async fn run(
     };
     let mut printer = Printer::new(specs.iter().map(|spec| spec.id.clone()));
     let mut handle = Supervisor::spawn(specs, options)?;
+    let _rebuilds = watch.map(|watch| watch.rebuild_through(handle.commands()));
     let mut ending = None;
     loop {
         tokio::select! {

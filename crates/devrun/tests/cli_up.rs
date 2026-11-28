@@ -251,8 +251,13 @@ kg · exited with code 0
 }
 
 fn spawn_headless(sandbox: &Sandbox, target: &str) -> Child {
+    spawn_up(sandbox, &[target, "--no-tui"])
+}
+
+fn spawn_up(sandbox: &Sandbox, args: &[&str]) -> Child {
     std::process::Command::new(assert_cmd::cargo::cargo_bin!("devrun"))
-        .args(["up", target, "--no-tui"])
+        .arg("up")
+        .args(args)
         .current_dir(sandbox.root())
         .env("DEVRUN_CONFIG_DIR", sandbox.config_dir())
         .env_remove("XDG_CONFIG_HOME")
@@ -339,4 +344,177 @@ fn interrupt_stops_every_service_and_leaves_no_process_behind() {
         ["web · stopping", "web · stopped", "stopped 1 service"]
     );
     assert!(!process_alive(&grandchild), "sleep {grandchild} survived");
+}
+
+#[test]
+fn up_help_documents_the_no_watch_switch() {
+    let sandbox = sandbox_with(&[service("web", "apps/web", "echo hi", "")]);
+    let output = sandbox.devrun().args(["up", "--help"]).output().unwrap();
+    let help = String::from_utf8(output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert!(
+        help.contains(
+            "--no-watch     Do not rebuild services when files in their watch dirs change"
+        ),
+        "{help}"
+    );
+    assert!(help.contains("--no-tui"), "{help}");
+}
+
+#[test]
+fn no_watch_with_no_tui_after_the_targets_behaves_like_no_tui_alone() {
+    let sandbox = sandbox_with(&[service("web", "apps/web", "sleep 0.2; echo web-line", "")]);
+    let run = |args: &[&str]| {
+        sandbox
+            .devrun()
+            .arg("up")
+            .args(args)
+            .timeout(RUN_TIMEOUT)
+            .output()
+            .unwrap()
+    };
+
+    let plain = run(&["web", "--no-tui"]);
+    let unwatched = run(&["web", "--no-watch", "--no-tui"]);
+    let leading = run(&["--no-watch", "web", "--no-tui"]);
+
+    assert_eq!(
+        String::from_utf8_lossy(&plain.stdout),
+        "web · starting
+web · running
+web | web-line
+web · exited with code 0
+1 service finished cleanly
+"
+    );
+    for other in [&unwatched, &leading] {
+        assert_eq!(other.status.code(), plain.status.code());
+        assert_eq!(other.stdout, plain.stdout);
+        assert_eq!(other.stderr, plain.stderr);
+    }
+}
+
+const QUIET_OBSERVATION: Duration = Duration::from_millis(1200);
+
+fn watched_sandbox() -> Sandbox {
+    let sandbox = sandbox_with(&[service(
+        "web",
+        "apps/web",
+        "echo web-up; sleep 1000",
+        "prepare = [\"echo prepared >> prepared.log\"]\nwatch = [\"packages/lib\"]",
+    )]);
+    sandbox.write("packages/lib/src/index.ts", "export const a = 1;\n");
+    sandbox.write("packages/lib/dist/index.js", "exports.a = 1;\n");
+    sandbox
+}
+
+fn prepared_runs(sandbox: &Sandbox) -> usize {
+    std::fs::read_to_string(sandbox.root().join("apps/web/prepared.log"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
+struct RunningUp {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+    seen: Vec<String>,
+}
+
+impl RunningUp {
+    fn start(sandbox: &Sandbox, args: &[&str]) -> Self {
+        let mut child = spawn_up(sandbox, args);
+        let lines = stream_lines(&mut child);
+        Self {
+            child,
+            lines,
+            seen: Vec::new(),
+        }
+    }
+
+    fn wait_for(&mut self, wanted: &str, occurrence: usize) {
+        let deadline = Instant::now() + RUN_TIMEOUT;
+        while self.seen.iter().filter(|line| *line == wanted).count() < occurrence {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(line) = self.lines.recv_timeout(remaining) else {
+                let _ = self.child.kill();
+                panic!("never saw {wanted:?} x{occurrence}: {:?}", self.seen);
+            };
+            self.seen.push(line);
+        }
+    }
+
+    fn observe_quietly(&mut self, window: Duration) -> Vec<String> {
+        let deadline = Instant::now() + window;
+        let mut observed = Vec::new();
+        while let Ok(line) = self
+            .lines
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            observed.push(line);
+        }
+        self.seen.extend(observed.iter().cloned());
+        observed
+    }
+
+    fn interrupt(mut self) -> Vec<String> {
+        let interrupted = std::process::Command::new("kill")
+            .args(["-INT", &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        let status = wait_with_deadline(&mut self.child);
+        self.seen.extend(self.lines.iter());
+        assert!(interrupted.success());
+        assert_eq!(status.code(), Some(0), "{:?}", self.seen);
+        self.seen
+    }
+}
+
+fn mentions_rebuild(lines: &[String]) -> bool {
+    lines.iter().any(|line| line.contains("rebuil"))
+}
+
+#[test]
+fn a_source_change_in_a_watch_dir_rebuilds_the_service_and_build_outputs_do_not() {
+    let sandbox = watched_sandbox();
+    let mut up = RunningUp::start(&sandbox, &["web", "--no-tui"]);
+    up.wait_for("web | web-up", 1);
+
+    sandbox.write("packages/lib/src/index.ts", "export const a = 2;\n");
+    up.wait_for("web · rebuilt", 1);
+    up.wait_for("web | web-up", 2);
+    assert_eq!(prepared_runs(&sandbox), 2);
+
+    sandbox.write("packages/lib/dist/index.js", "exports.a = 2;\n");
+    sandbox.write("packages/lib/tsconfig.tsbuildinfo", "{}\n");
+    sandbox.write("packages/lib/node_modules/dep/index.js", "\n");
+    let after_outputs = up.observe_quietly(QUIET_OBSERVATION);
+    let seen = up.interrupt();
+
+    assert!(!mentions_rebuild(&after_outputs), "{after_outputs:?}");
+    assert_eq!(prepared_runs(&sandbox), 2);
+    assert_eq!(
+        seen.iter()
+            .filter(|line| *line == "web · rebuilding 1/1")
+            .count(),
+        1,
+        "{seen:?}"
+    );
+    assert_eq!(seen[seen.len() - 1], "stopped 1 service");
+}
+
+#[test]
+fn no_watch_leaves_the_service_alone_when_its_watch_dir_changes() {
+    let sandbox = watched_sandbox();
+    let mut up = RunningUp::start(&sandbox, &["web", "--no-watch", "--no-tui"]);
+    up.wait_for("web | web-up", 1);
+
+    sandbox.write("packages/lib/src/index.ts", "export const a = 2;\n");
+    let after_change = up.observe_quietly(QUIET_OBSERVATION);
+    let seen = up.interrupt();
+
+    assert!(!mentions_rebuild(&after_change), "{after_change:?}");
+    assert_eq!(prepared_runs(&sandbox), 1);
+    assert_eq!(seen[seen.len() - 1], "stopped 1 service");
 }

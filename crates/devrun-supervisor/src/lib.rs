@@ -16,6 +16,6 @@ pub use contract::{
     ServiceStatus,
 };
 pub use error::SupervisorError;
-pub use handle::{Supervisor, SupervisorHandle};
+pub use handle::{CommandSender, Supervisor, SupervisorHandle};
 pub use signals::TerminationSignals;
 pub use spec::{LaunchSpec, SupervisorOptions};

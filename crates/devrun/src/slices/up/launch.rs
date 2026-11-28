@@ -46,7 +46,7 @@ fn launch_spec(service: &Service, root: &Path, planned: &BTreeSet<&ServiceName>)
     }
 }
 
-fn service_id(name: &ServiceName) -> ServiceId {
+pub fn service_id(name: &ServiceName) -> ServiceId {
     ServiceId::new(name.as_str())
 }
 
